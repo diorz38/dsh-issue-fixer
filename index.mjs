@@ -73,6 +73,8 @@ function taskPrompt(settings, issue) {
     '',
     `Work in the repository at ${settings.cwd}; follow its AGENTS.md / CLAUDE.md instructions.`,
     'A dedicated fix branch has already been checked out for this issue; commit your work to it.',
+    'Never commit to the main/master/default branch and never switch branches: all your commits',
+    'belong on the fix branch that is already checked out.',
     'Steps: verify or reproduce the issue, implement the smallest safe fix, add a regression',
     'test if feasible, run the repository quality gates, then commit locally with a descriptive',
     settings.autoPr

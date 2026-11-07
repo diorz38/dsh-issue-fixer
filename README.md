@@ -102,7 +102,9 @@ Before each session the plugin switches the checkout onto a fresh local branch `
 from the *base branch* — the branch that was checked out when watching started. Sequential fixes therefore
 never stack on each other; a name collision (re-run of the same issue) gets a short random suffix. The
 checkout is left on the fix branch for you to review and merge or delete. The plugin never switches back
-on its own, never merges, never deletes branches.
+on its own, never merges, never deletes branches. The task prompt also forbids the agent from
+committing to the main/master/default branch or switching branches — every commit must land on the
+fix branch.
 
 The agent itself never pushes and never comments on the issue. With auto pull requests **off**
 (default) you review the fix branch and push it yourself. With auto pull requests **on**, after
