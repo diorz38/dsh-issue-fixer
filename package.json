@@ -1,6 +1,6 @@
 {
   "name": "dsh-issue-fixer",
-  "version": "0.6.4",
+  "version": "0.6.5",
   "description": "DeepSeek Harness plugin: watches a GitHub repository and lets an agent fix its open issues, but only for repositories the logged-in account can push to.",
   "license": "MIT",
   "type": "module",

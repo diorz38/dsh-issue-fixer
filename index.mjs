@@ -374,6 +374,7 @@ export function apply(ctx, rawConfig = {}) {
         info(`issue-fixer: queued ${fresh.map((issue) => `#${issue.number}`).join(', ')} from ${settings.repo}`);
       }
       await drain();
+      await repairPendingPrs();
     } catch (error) {
       state.lastError = String(error);
       warn(`issue-fixer: poll failed: ${String(error)}`);
@@ -381,6 +382,60 @@ export function apply(ctx, rawConfig = {}) {
       if (/\b401\b|Bad credentials/i.test(String(error))) void revalidate();
     } finally {
       polling = false;
+    }
+  }
+
+  /**
+   * Republish fix branches that were pushed without a PR (an older version
+   * pushed an empty branch, or PR creation failed). Runs on poll after the
+   * queue drains; a branch with commits and no PR gets one, an empty one is
+   * deleted from the remote and its issue becomes retryable.
+   */
+  async function repairPendingPrs() {
+    if (settings.autoPr !== true || !token) return;
+    const pending = Object.entries(state.processed)
+      .filter(([, record]) => record?.status === 'done' && record.branch && record.prError && !record.prUrl)
+      .map(([number, record]) => ({ number: Number(number), ...record }));
+    for (const record of pending) {
+      try {
+        const commits = await commitsAhead(settings.cwd, baseBranch, record.branch);
+        if (commits === 0) {
+          await git(settings.cwd, ['push', pushRemote || 'origin', '--delete', record.branch]);
+          state.processed[record.number] = { ...record, status: 'failed', prError: undefined, attempts: 0, error: 'the fix branch had no commits; pushed branch removed and the issue will be retried' };
+          warn(`issue-fixer: ${settings.repo}#${record.number} had an empty fix branch; deleted the remote branch and will retry`);
+          await persist();
+          continue;
+        }
+        const local = await git(settings.cwd, ['rev-parse', '--verify', `refs/heads/${record.branch}`]);
+        if (!local.ok) {
+          // The local fix branch is gone, so there is nothing to publish and the
+          // issue stays stuck forever unless it becomes retryable again.
+          state.processed[record.number] = { ...record, status: 'failed', prError: undefined, attempts: 0, error: `fix branch ${record.branch} no longer exists; the issue will be retried` };
+          await persist();
+          warn(`issue-fixer: ${settings.repo}#${record.number} fix branch ${record.branch} is gone; will retry the issue`);
+          continue;
+        }
+        const pushed = await git(settings.cwd, ['push', pushRemote || 'origin', record.branch]);
+        if (!pushed.ok) {
+          warn(`issue-fixer: cannot republish ${record.branch}: ${pushed.error}`);
+          continue;
+        }
+        const pr = await createPullRequest(token, {
+          repo: settings.repo,
+          title: `Fix #${record.number}: ${record.title ?? ''}`.trim(),
+          body: [`Fixes #${record.number}`, '', `Automated fix by dsh-issue-fixer session \`${record.sessionId ?? '?'}\`.`].join('\n'),
+          head: record.branch,
+          base: baseBranch ?? undefined,
+        });
+        state.processed[record.number] = pr.ok
+          ? { ...record, prUrl: pr.url, prError: undefined }
+          : { ...record, prError: pr.error };
+        await persist();
+        if (pr.ok) info(`issue-fixer: opened PR for ${settings.repo}#${record.number}: ${pr.url}`);
+        else warn(`issue-fixer: PR retry for ${settings.repo}#${record.number} failed: ${pr.error}`);
+      } catch (error) {
+        warn(`issue-fixer: PR repair for ${settings.repo}#${record.number} failed: ${String(error)}`);
+      }
     }
   }
 

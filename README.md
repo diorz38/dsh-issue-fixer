@@ -113,6 +113,8 @@ fix branch.
 
 The agent itself never pushes and never comments on the issue. A session that leaves no commit on the
 fix branch counts as a failed attempt — the plugin does not push it and does not report it as done.
+Every poll also repairs earlier runs: a fix branch pushed without a PR gets its PR created, and an empty
+pushed branch is deleted remotely and its issue made retryable again.
 With auto pull requests **off**
 (default) you review the fix branch and push it yourself. With auto pull requests **on**, after
 each finished session the plugin pushes the fix branch to the remote that points at the watched
