@@ -13,7 +13,7 @@ import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { resolveIdentity, checkRepoAccess } from './github.mjs';
-import { checkCheckout } from './repo.mjs';
+import { checkCheckout, prepareFixBranch } from './repo.mjs';
 import {
   DEFAULT_INTERVAL_MS,
   MIN_INTERVAL_MS,
@@ -71,6 +71,7 @@ function taskPrompt(settings, issue) {
     body === '' ? '(no body)' : body,
     '',
     `Work in the repository at ${settings.cwd}; follow its AGENTS.md / CLAUDE.md instructions.`,
+    'A dedicated fix branch has already been checked out for this issue; commit your work to it.',
     'Steps: verify or reproduce the issue, implement the smallest safe fix, add a regression',
     'test if feasible, run the repository quality gates, then commit locally with a descriptive',
     'message. Do not push, open a PR, or comment on the issue.',
@@ -109,6 +110,8 @@ export function apply(ctx, rawConfig = {}) {
   let report = null; // last verification report
   let timerStop = null;
   let polling = false;
+  // Branch fixes are cut from; captured when watching starts, never a fix branch itself.
+  let baseBranch = null;
   let disposed = false;
   let started = false;
   const queue = [];
@@ -262,6 +265,8 @@ export function apply(ctx, rawConfig = {}) {
     stopWatching();
     if (disposed || report?.phase !== 'ready') return;
     token = report.internal.token;
+    const current = report.checkout?.branch ?? null;
+    if (current && !current.startsWith('issuefix/')) baseBranch = current;
     timerStop = makeInterval(() => void poll(), settings.intervalMs);
     void poll();
     info(`issue-fixer: watching ${settings.repo} in ${settings.cwd} every ${Math.round(settings.intervalMs / 60000)} min as ${report.internal.login}`);
@@ -354,6 +359,15 @@ export function apply(ctx, rawConfig = {}) {
     if (!agents || !sessions) {
       throw new Error('agent services (agents/sessions) are unavailable in this profile; cannot start a fix session');
     }
+
+    // Isolate the fix on its own branch before the agent touches anything.
+    const branch = await prepareFixBranch({
+      cwd: settings.cwd,
+      base: baseBranch,
+      name: `issuefix/${issue.number}`,
+    });
+    if (!branch.ok) throw new Error(branch.error);
+
     const { installModelSelection, createUserMessage } = await loadAgentModules();
     const selectionService = ctx.get?.('agentDefaultModel');
     const selection = selectionService?.currentSelection?.() ?? {};
@@ -398,15 +412,15 @@ export function apply(ctx, rawConfig = {}) {
     } finally {
       stopErrors();
     }
-    return sessionId;
+    return { sessionId, branch: branch.branch };
   }
 
   async function drain() {
     while (queue.length > 0 && !disposed) {
       const issue = queue.shift();
       try {
-        const sessionId = await runFixSession(issue);
-        state.processed[issue.number] = { sessionId, at: nowIso(), status: 'done' };
+        const { sessionId, branch } = await runFixSession(issue);
+        state.processed[issue.number] = { sessionId, branch, at: nowIso(), status: 'done' };
         info(`issue-fixer: ${settings.repo}#${issue.number} fix session ${sessionId} finished`);
       } catch (error) {
         state.processed[issue.number] = { at: nowIso(), status: 'failed', error: String(error) };

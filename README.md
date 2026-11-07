@@ -95,6 +95,12 @@ default model, working in the configured checkout, and asks the agent to:
 3. run the relevant tests,
 4. **commit locally** and report what changed.
 
+Before each session the plugin switches the checkout onto a fresh local branch `issuefix/<number>` cut
+from the *base branch* — the branch that was checked out when watching started. Sequential fixes therefore
+never stack on each other; a name collision (re-run of the same issue) gets a short random suffix. The
+checkout is left on the fix branch for you to review and merge or delete. The plugin never switches back
+on its own, never merges, never deletes branches.
+
 It is explicitly told not to push, not to open pull requests and not to comment on the issue. You review
 and push.
 

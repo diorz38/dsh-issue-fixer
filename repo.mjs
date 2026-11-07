@@ -22,7 +22,7 @@ function execFileText(command, args, options) {
   });
 }
 
-async function git(cwd, args, timeout = 15000) {
+export async function git(cwd, args, timeout = 15000) {
   try {
     const { stdout, stderr } = await execFileText('git', ['-C', cwd, ...args], {
       timeout,
@@ -148,4 +148,28 @@ export async function checkCheckout({ cwd, repo }) {
     dirty: dirtyLines.length,
     remotes,
   };
+}
+
+/**
+ * Switch the checkout onto a fresh fix branch cut from `base` (current HEAD
+ * when base is unknown). Returning to `base` first keeps sequential fixes from
+ * stacking on each other. An existing branch name gets a short random suffix
+ * so a re-run never mixes histories. Never merges, deletes, or pushes.
+ */
+export async function prepareFixBranch({ cwd, base, name }) {
+  if (base && base !== '(detached HEAD)') {
+    const back = await git(cwd, ['switch', base]);
+    if (!back.ok) return { ok: false, error: `cannot switch to base branch "${base}": ${back.error}` };
+  }
+  let lastError = '';
+  let branch = name;
+  // ponytail: unique-suffix retry; upgrade path is a per-issue `git worktree`
+  // pool once parallel sessions are needed.
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const created = await git(cwd, ['switch', '-c', branch]);
+    if (created.ok) return { ok: true, branch };
+    lastError = created.error;
+    branch = `${name}-${Math.random().toString(36).slice(2, 6)}`;
+  }
+  return { ok: false, error: `cannot create fix branch "${name}": ${lastError}` };
 }
