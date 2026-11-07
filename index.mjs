@@ -142,7 +142,16 @@ export function apply(ctx, rawConfig = {}) {
     }
   }
 
-  // ------------------------------------------------------------- verification
+  const issuefix = { maxAttempts: 3 };
+
+  /** Fresh issue, or a failed one that still has attempts left. */
+  function pickable(item) {
+    const record = state.processed[item.number];
+    if (record === undefined) return item.number > (state.baseline?.number ?? 0);
+    if (record.status !== 'failed') return false;
+    return (record.attempts ?? 1) < issuefix.maxAttempts;
+  }
+
 
   function publicSettings(candidate = settings) {
     return {
@@ -354,8 +363,7 @@ export function apply(ctx, rawConfig = {}) {
         return;
       }
       const fresh = items
-        .filter((item) => wantedIssue(item, settings) && item.number > state.baseline.number
-          && state.processed[item.number] === undefined)
+        .filter((item) => wantedIssue(item, settings) && pickable(item))
         .sort((a, b) => a.number - b.number);
       for (const issue of fresh) queue.push(issue);
       if (maxNumber > state.baseline.number) state.baseline.number = maxNumber;
@@ -432,13 +440,24 @@ export function apply(ctx, rawConfig = {}) {
     const baseOptions = {
       agentOptions: { provider: selection.provider, model: selection.model },
       meta: { cwd: settings.cwd },
-      setup: (agentCtx) => installModelSelection(agentCtx, { current: selection, assembled: undefined }),
+      // The agents service calls `(await setup(...))?.commit()`, so this must
+      // return nothing: installModelSelection returns a disposer function,
+      // and a truthy value there makes the host call `.commit()` on it.
+      setup: (agentCtx) => {
+        const dispose = installModelSelection(agentCtx, { current: selection, assembled: undefined });
+        if (typeof agentCtx?.effect === 'function') {
+          agentCtx.effect(() => dispose, 'issue-fixer:model-selection');
+        }
+      },
     };
     let sessionId = `session-issuefix-${slug}`;
     let handle;
     try {
       handle = await agents.create({ sessionId, ...baseOptions });
     } catch (error) {
+      // Only a taken id is retryable; anything else is a real failure that a
+      // fresh UUID would hide.
+      if (!/exist|taken|duplicate|already/i.test(String(error))) throw error;
       warn(`issue-fixer: session id "${sessionId}" taken (${String(error)}); minting a new one`);
       sessionId = `session-issuefix-${randomUUID()}`;
       handle = await agents.create({ sessionId, ...baseOptions });
@@ -489,8 +508,15 @@ export function apply(ctx, rawConfig = {}) {
         info(`issue-fixer: ${settings.repo}#${issue.number} fix session ${sessionId} finished`);
         if (pr && !pr.ok) warn(`issue-fixer: ${settings.repo}#${issue.number} PR failed: ${pr.error}`);
       } catch (error) {
-        state.processed[issue.number] = { title: issue.title, at: nowIso(), status: 'failed', error: String(error) };
-        warn(`issue-fixer: fix session for ${settings.repo}#${issue.number} failed: ${String(error)}`);
+        const attempts = (state.processed[issue.number]?.attempts ?? 0) + 1;
+        state.processed[issue.number] = {
+          title: issue.title,
+          at: nowIso(),
+          status: 'failed',
+          attempts,
+          error: String(error),
+        };
+        warn(`issue-fixer: fix session for ${settings.repo}#${issue.number} failed (attempt ${attempts}/${issuefix.maxAttempts}): ${String(error)}`);
       }
       running = null;
       await persist();
