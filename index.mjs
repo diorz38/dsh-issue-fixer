@@ -478,6 +478,7 @@ export function apply(ctx, rawConfig = {}) {
         state.processed[issue.number] = {
           sessionId,
           branch,
+          title: issue.title,
           at: nowIso(),
           status: 'done',
           ...(pr ? (pr.ok ? { prUrl: pr.url } : { prError: pr.error }) : {}),
@@ -485,7 +486,7 @@ export function apply(ctx, rawConfig = {}) {
         info(`issue-fixer: ${settings.repo}#${issue.number} fix session ${sessionId} finished`);
         if (pr && !pr.ok) warn(`issue-fixer: ${settings.repo}#${issue.number} PR failed: ${pr.error}`);
       } catch (error) {
-        state.processed[issue.number] = { at: nowIso(), status: 'failed', error: String(error) };
+        state.processed[issue.number] = { title: issue.title, at: nowIso(), status: 'failed', error: String(error) };
         warn(`issue-fixer: fix session for ${settings.repo}#${issue.number} failed: ${String(error)}`);
       }
       await persist();

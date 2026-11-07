@@ -418,7 +418,7 @@ window.__ModuleLoader__.load({
           }
           if (act.recent && act.recent.length > 0) {
             rows.push(row("Recent", h("div", { style: S.mono }, act.recent.map(function (item) {
-              return "#" + item.number + " " + (item.status || "?")
+              return "#" + item.number + " " + (item.title ? item.title + " · " : "") + (item.status || "?")
                 + (item.branch ? " · " + item.branch : "")
                 + (item.prUrl ? " · PR opened" : "")
                 + (item.prError ? " · PR failed" : "");
