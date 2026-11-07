@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { parseRepoRef, prepareFixBranch } from './repo.mjs';
+import { isNewer } from './update.mjs';
 
 function sh(cwd, ...args) {
   execFileSync('git', ['-C', cwd, ...args], { windowsHide: true });
@@ -18,6 +19,12 @@ try {
   assert.equal(parseRepoRef('https://github.com/o/r.git'), 'o/r');
   assert.equal(parseRepoRef('git@github.com:o/r.git'), 'o/r');
   assert.equal(parseRepoRef('https://gitlab.com/o/r'), null);
+
+  assert.equal(isNewer('0.6.0', '0.5.0'), true);
+  assert.equal(isNewer('v0.5.1', '0.5.0'), true);
+  assert.equal(isNewer('0.5.0', '0.5.0'), false);
+  assert.equal(isNewer('0.5.0', '0.6.0'), false);
+  assert.equal(isNewer('junk', '0.5.0'), false);
 
   sh(tmp, 'init', '-b', 'main');
   sh(tmp, 'config', 'user.email', 't@example.com');

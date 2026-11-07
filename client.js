@@ -58,6 +58,7 @@ window.__ModuleLoader__.load({
         useGhCli: (settings.tokenSource || "gh-cli") !== "stored",
         token: "",
         autoPr: settings.autoPr === true,
+        autoUpdate: settings.autoUpdate !== false,
       };
     }
 
@@ -73,6 +74,7 @@ window.__ModuleLoader__.load({
         useGhCli: draft.useGhCli === true,
         githubToken: draft.useGhCli === true ? "" : draft.token,
         autoPr: draft.autoPr === true,
+        autoUpdate: draft.autoUpdate !== false,
       };
     }
 
@@ -408,6 +410,12 @@ window.__ModuleLoader__.load({
             row("Fixed / failed", (act.counts ? act.counts.done : 0) + " / " + (act.counts ? act.counts.failed : 0)),
           ];
           if (act.lastError) rows.push(row("Last error", h("span", { style: S.mono }, act.lastError)));
+          if (status.update) {
+            var up = status.update;
+            rows.push(row("Self-update", up.applied
+              ? "updated " + up.current + " → " + up.latest + " (" + (up.mode || "?") + ") — restart DSH Desktop to activate"
+              : (up.error ? h("span", { style: S.mono }, up.error) : "current " + (up.current || "?") + (up.latest ? " · latest " + up.latest : ""))));
+          }
           if (act.recent && act.recent.length > 0) {
             rows.push(row("Recent", h("div", { style: S.mono }, act.recent.map(function (item) {
               return "#" + item.number + " " + (item.status || "?")
@@ -461,6 +469,12 @@ window.__ModuleLoader__.load({
                 { style: { display: "flex", gap: 8, alignItems: "center" } },
                 h("input", { type: "checkbox", checked: draft.autoPr === true, disabled: disabled, onChange: function (event) { edit({ autoPr: event.target.checked }); } }),
                 h("span", {}, "After each fix: push the branch and open a pull request automatically"),
+              ),
+              h(
+                "label",
+                { style: { display: "flex", gap: 8, alignItems: "center" } },
+                h("input", { type: "checkbox", checked: draft.autoUpdate !== false, disabled: disabled, onChange: function (event) { edit({ autoUpdate: event.target.checked }); } }),
+                h("span", {}, "Keep the plugin itself up to date (checks GitHub releases daily)"),
               ),
               h("p", { style: S.hint }, "The plugin only runs when this account owns the repository or has push, maintain or admin access. Read-only clones are rejected."),
             ),

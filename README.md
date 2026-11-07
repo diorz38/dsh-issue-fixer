@@ -122,6 +122,20 @@ warning log — the local fix commits are never lost.
 - The browser half is a plain classic-script bundle (`client.js`) registered as a `settings.section`; no
   build step, no bundler, no dependencies.
 
+## Self-update
+
+The plugin checks the [`diorz38/dsh-issue-fixer`](https://github.com/diorz38/dsh-issue-fixer) GitHub
+releases at startup and once a day, and updates itself when a newer release exists:
+
+- a `file:///` checkout (Option 2 install) updates with `git pull --ff-only`, so the tree stays clean;
+- a pnpm install downloads the release tarball and copies the published files over the package
+  (the lockfile keeps the old commit hash — cosmetic only; `pnpm add` re-syncs it).
+
+Applied files take effect at the next DSH Desktop restart — the running code is never swapped
+mid-flight, and the state file lives outside the plugin directory, so an interrupted update cannot
+lose settings. The outcome is shown under **Activity → Self-update**. Untick
+**Keep the plugin itself up to date** in the setup form to disable the checks entirely.
+
 ## Removing it
 
 Delete the insert (Option 2) or remove the bundle entry and run `pnpm remove dsh-issue-fixer` (Option 1),

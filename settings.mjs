@@ -56,6 +56,7 @@ export function normalizeSettings(raw = {}) {
       : [],
     githubToken: typeof raw.githubToken === 'string' ? raw.githubToken.trim() : '',
     autoPr: raw.autoPr === true,
+    autoUpdate: raw.autoUpdate !== false,
   };
   return settings;
 }

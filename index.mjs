@@ -14,6 +14,7 @@ import { fileURLToPath } from 'node:url';
 
 import { resolveIdentity, checkRepoAccess, createPullRequest } from './github.mjs';
 import { checkCheckout, git, prepareFixBranch } from './repo.mjs';
+import { selfUpdate } from './update.mjs';
 import {
   DEFAULT_INTERVAL_MS,
   MIN_INTERVAL_MS,
@@ -99,6 +100,7 @@ export function apply(ctx, rawConfig = {}) {
   const info = (message) => (typeof log.info === 'function' ? log.info(message) : console.info(message));
 
   const home = getHarnessHome();
+  const pluginDir = dirname(fileURLToPath(import.meta.url));
   const config = rawConfig ?? {};
   const stateFile = typeof config.stateFile === 'string' && config.stateFile !== ''
     ? config.stateFile
@@ -120,6 +122,8 @@ export function apply(ctx, rawConfig = {}) {
   let started = false;
   const queue = [];
   let agentModules;
+  let updateInfo = null; // last self-update outcome, surfaced in the status API
+  let updateTimer = null;
 
   // ---------------------------------------------------------------- state io
 
@@ -146,6 +150,7 @@ export function apply(ctx, rawConfig = {}) {
       labels: candidate?.labels ?? [],
       tokenSource: candidate?.githubToken ? 'stored' : 'gh-cli',
       autoPr: candidate?.autoPr === true,
+      autoUpdate: candidate?.autoUpdate !== false,
     };
   }
 
@@ -236,8 +241,29 @@ export function apply(ctx, rawConfig = {}) {
         lastError: state?.lastError ?? null,
         ...summarizeProcessed(state?.processed ?? {}),
       },
+      update: updateInfo,
       stateFile,
     };
+  }
+
+  // -------------------------------------------------------------- self-update
+
+  const UPDATE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
+  async function checkSelfUpdate(reason) {
+    if (disposed || settings?.autoUpdate === false) return;
+    try {
+      const result = await selfUpdate({ pluginDir, token });
+      updateInfo = { ...result, checkedAt: nowIso(), reason };
+      if (result.applied) {
+        info(`issue-fixer: self-updated ${result.current} → ${result.latest} (${result.mode}); restart DSH Desktop to activate`);
+      } else if (result.error) {
+        warn(`issue-fixer: self-update failed: ${result.error}`);
+      }
+    } catch (error) {
+      updateInfo = { applied: false, error: String(error), checkedAt: nowIso(), reason };
+      warn(`issue-fixer: self-update check failed: ${String(error)}`);
+    }
   }
 
   // ---------------------------------------------------------------- watching
@@ -513,6 +539,7 @@ export function apply(ctx, rawConfig = {}) {
         labels: Array.isArray(body.labels) ? body.labels : base.labels,
         githubToken,
         autoPr: typeof body.autoPr === 'boolean' ? body.autoPr : base.autoPr,
+        autoUpdate: typeof body.autoUpdate === 'boolean' ? body.autoUpdate : base.autoUpdate,
       }),
       tokenFromUi: body.useGhCli === true ? false : (typeof body.githubToken === 'string' && body.githubToken.trim() !== '') || tokenFromUi,
     };
@@ -602,10 +629,16 @@ export function apply(ctx, rawConfig = {}) {
       } catch (error) {
         warn(`issue-fixer: startup failed: ${String(error)}`);
       }
+      // Self-update runs regardless of setup phase; a fresh install should be
+      // fixable before the user finishes configuring it.
+      void checkSelfUpdate('startup');
+      updateTimer = setInterval(() => void checkSelfUpdate('daily'), UPDATE_INTERVAL_MS);
+      updateTimer.unref?.();
     })();
     return () => {
       disposed = true;
       stopWatching();
+      if (updateTimer) clearInterval(updateTimer);
     };
   }, 'issue-fixer');
 
