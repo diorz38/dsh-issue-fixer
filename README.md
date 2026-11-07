@@ -78,15 +78,19 @@ Open **Settings → Issue Fixer** and fill in:
 2. **Working directory** — the local checkout the agent commits in.
 3. **Poll interval** (minutes, minimum 1) and optional **labels** (an issue must carry every label to be
    picked up).
-4. Choose **Use the GitHub CLI login on this machine** or paste a **token**.
-5. Optionally tick **After each fix: push the branch and open a pull request automatically**.
+4. **Baseline issue number** — only issues numbered above it are picked. `0` reopens every open issue.
+   The form shows the current baseline; **Apply** saves a new one and polls immediately, so lowering it
+   is how you get the plugin to revisit older issues.
+5. Choose **Use the GitHub CLI login on this machine** or paste a **token**.
+6. Optionally tick **After each fix: push the branch and open a pull request automatically**.
 
 Press **Check access** to see the full report without saving, then **Save and start watching**. Saving is
 only accepted when every blocking gate passes.
 
 Once saved, the plugin polls `state=open`, newest first, every `intervalMs` (default 5 min). The first poll
 only records a baseline (the newest issue number) and processes nothing; later polls pick up issues newer
-than the baseline, plus issues that were edited into the label set.
+than the baseline, plus issues that were edited into the label set. A failed fix is retried on later polls
+until it has three attempts; a successful one is never repeated.
 
 ## What the agent is asked to do
 

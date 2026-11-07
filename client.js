@@ -59,6 +59,9 @@ window.__ModuleLoader__.load({
         token: "",
         autoPr: settings.autoPr === true,
         autoUpdate: settings.autoUpdate !== false,
+        baseline: status && status.activity && status.activity.baseline && status.activity.baseline.number
+          ? String(status.activity.baseline.number)
+          : "0",
       };
     }
 
@@ -337,8 +340,28 @@ window.__ModuleLoader__.load({
             });
         }
 
-        function runReset() {
-          setBusy("reset");
+        function runBaseline() {
+          setBusy("baseline");
+          setNote(null);
+          call("POST", "baseline", { number: Number(draft.baseline) })
+            .then(function (result) {
+              setStatus(result.status || null);
+              setDraft(function (previous) {
+                return Object.assign({}, previous || {}, {
+                  baseline: result.baseline && result.baseline.number !== undefined ? String(result.baseline.number) : "0",
+                });
+              });
+              setNote({ kind: "good", text: "Baseline set to #" + (result.baseline ? result.baseline.number : 0) + " — the next poll acts on it." });
+            })
+            .catch(function (error) {
+              setNote({ kind: "bad", text: String(error.message || error) });
+            })
+            .then(function () {
+              setBusy("");
+            });
+        }
+
+        function runReset() {          setBusy("reset");
           setNote(null);
           call("POST", "reset", {})
             .then(function (result) {
@@ -480,6 +503,11 @@ window.__ModuleLoader__.load({
                 h("input", { style: S.input, type: "number", min: 1, value: draft.intervalMinutes, disabled: disabled, onChange: function (event) { edit({ intervalMinutes: event.target.value }); } })),
               field("Only these labels (comma separated)", "optional — an issue must carry every listed label",
                 h("input", { style: S.input, value: draft.labels, placeholder: "bug, needs-fix", disabled: disabled, onChange: function (event) { edit({ labels: event.target.value }); } })),
+              field("Baseline issue number", "only issues with a higher number are picked — 0 reopens every open issue",
+                h("div", { style: { display: "flex", gap: 8 } },
+                  h("input", { style: S.input, type: "number", min: 0, value: draft.baseline, disabled: disabled, onChange: function (event) { edit({ baseline: event.target.value }); } }),
+                  h("button", { style: S.button, disabled: disabled || !status || status.phase !== "ready", onClick: runBaseline }, "Apply")
+                )),
             ),
             h(
               "div",

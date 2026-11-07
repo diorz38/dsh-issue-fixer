@@ -611,8 +611,26 @@ export function apply(ctx, rawConfig = {}) {
     return jsonResponse(200, { saved: true, status: publicStatus() });
   }
 
-  async function resetRoute() {
-    stopWatching();
+  /**
+   * Move the baseline. Issues are only picked when their number is above it, so
+   * lowering it reopens older issues; 0 makes every open issue eligible.
+   */
+  async function baselineRoute(request) {
+    const body = await readBody(request);
+    const number = Number(body.number);
+    if (!Number.isInteger(number) || number < 0) {
+      return jsonResponse(400, { error: 'baseline must be an integer >= 0' });
+    }
+    if (!state) state = { settings: null, processed: {}, baseline: null };
+    if (!settings?.repo) return jsonResponse(409, { error: 'set up the repository first' });
+    state.baseline = { repo: settings.repo, number };
+    await persist();
+    info(`issue-fixer: baseline for ${settings.repo} set to #${number}`);
+    void poll();
+    return jsonResponse(200, { baseline: state.baseline, status: publicStatus() });
+  }
+
+  async function resetRoute() {    stopWatching();
     settings = normalizeSettings(defaults);
     token = null;
     tokenFromUi = false;
@@ -633,6 +651,7 @@ export function apply(ctx, rawConfig = {}) {
     { path: `${ROUTE_PREFIX}.status`, methods: ['GET'], requestBody: 'buffered', fetch: route(statusRoute) },
     { path: `${ROUTE_PREFIX}.check`, methods: ['POST'], requestBody: 'buffered', fetch: route(checkRoute) },
     { path: `${ROUTE_PREFIX}.save`, methods: ['POST'], requestBody: 'buffered', fetch: route(saveRoute) },
+    { path: `${ROUTE_PREFIX}.baseline`, methods: ['POST'], requestBody: 'buffered', fetch: route(baselineRoute) },
     { path: `${ROUTE_PREFIX}.reset`, methods: ['POST'], requestBody: 'buffered', fetch: route(resetRoute) },
   ];
 
