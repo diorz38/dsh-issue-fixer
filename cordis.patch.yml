@@ -1,0 +1,6 @@
+# Inserted by the dsh-issue-fixer bundle. `name` is the package name so the
+# patch also works after `pnpm add github:diorz38/dsh-issue-fixer`.
+- insert:
+    - id: issue-fixer
+      name: dsh-issue-fixer
+      config: {}

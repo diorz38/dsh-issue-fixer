@@ -1,0 +1,4 @@
+node_modules/
+*.log
+issue-fixer-state.json
+.DS_Store

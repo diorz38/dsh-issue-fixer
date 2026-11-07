@@ -1,0 +1,55 @@
+{
+  "name": "dsh-issue-fixer",
+  "version": "0.3.0",
+  "description": "DeepSeek Harness plugin: watches a GitHub repository and lets an agent fix its open issues, but only for repositories the logged-in account can push to.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./client": "./client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": ["slots", "locale"]
+    }
+  },
+  "files": [
+    "index.mjs",
+    "client.js",
+    "github.mjs",
+    "repo.mjs",
+    "settings.mjs",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "github",
+    "issues",
+    "agent"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/diorz38/dsh-issue-fixer.git"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-agent": "*",
+    "@deepseek-ai/dsh-llm": "*"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-agent": { "optional": true },
+    "@deepseek-ai/dsh-llm": { "optional": true }
+  }
+}

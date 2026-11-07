@@ -1,0 +1,573 @@
+// dsh-issue-fixer: watch a GitHub repository and fix its open issues.
+//
+// First install has nothing configured, so the plugin activates in an inert
+// "setup required" phase and serves a small setup/status API that the client
+// plugin renders under Settings → Issue Fixer. The plugin refuses to operate
+// until all required fields are filled AND the machine's logged-in GitHub
+// account can actually push to the repository (owner/admin/maintain/push).
+//
+// Host half of the dual-face package; the browser half is ./client.js, declared
+// through `dsh.client` in package.json and served by dsh-client-modules.
+import { randomUUID } from 'node:crypto';
+import { basename, dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import { resolveIdentity, checkRepoAccess } from './github.mjs';
+import { checkCheckout } from './repo.mjs';
+import {
+  DEFAULT_INTERVAL_MS,
+  MIN_INTERVAL_MS,
+  REQUIRED_FIELDS,
+  isConfigured,
+  loadState,
+  normalizeSettings,
+  saveState,
+  settingsFromState,
+  settingsProblems,
+} from './settings.mjs';
+
+export const name = 'issue-fixer';
+
+// No hard service dependencies: the setup UI must load even on an installation
+// where the agent services are missing or still starting. The agent services are
+// resolved lazily when a fix session actually starts.
+export const inject = [];
+
+const ROUTE_PREFIX = '/api/issue-fixer';
+const BODY_LIMIT_BYTES = 32 * 1024;
+const PROMPT_BODY_LIMIT = 8000;
+
+function getHarnessHome() {
+  if (process.env.DSH_HOME) return process.env.DSH_HOME;
+  const pluginDir = dirname(fileURLToPath(import.meta.url));
+  // .../harness/profiles/plugins/<plugin> → .../harness
+  let dir = pluginDir;
+  for (let i = 0; i < 6; i += 1) {
+    if (basename(dir) === 'profiles') return dirname(dir);
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return dirname(dirname(pluginDir));
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+/** Issue predicate: open non-PR issues carrying every configured label. */
+function wantedIssue(item, settings) {
+  if (item.pull_request !== undefined) return false; // the issues API also lists PRs
+  if (item.state !== 'open') return false;
+  return settings.labels.every((want) => item.labels?.some((label) => label.name === want));
+}
+
+function taskPrompt(settings, issue) {
+  const body = (issue.body ?? '').slice(0, PROMPT_BODY_LIMIT);
+  return [
+    `Fix GitHub issue ${settings.repo}#${issue.number}: ${issue.title}`,
+    '',
+    'Issue body:',
+    body === '' ? '(no body)' : body,
+    '',
+    `Work in the repository at ${settings.cwd}; follow its AGENTS.md / CLAUDE.md instructions.`,
+    'Steps: verify or reproduce the issue, implement the smallest safe fix, add a regression',
+    'test if feasible, run the repository quality gates, then commit locally with a descriptive',
+    'message. Do not push, open a PR, or comment on the issue.',
+  ].join('\n');
+}
+
+function summarizeProcessed(processed) {
+  const rows = Object.entries(processed)
+    .map(([number, record]) => ({ number: Number(number), ...record }))
+    .sort((a, b) => b.number - a.number)
+    .slice(0, 10);
+  const counts = { done: 0, failed: 0 };
+  for (const record of Object.values(processed)) {
+    if (record?.status === 'done') counts.done += 1;
+    else if (record?.status === 'failed') counts.failed += 1;
+  }
+  return { counts, recent: rows };
+}
+
+export function apply(ctx, rawConfig = {}) {
+  const log = ctx.logger ?? console;
+  const warn = (message) => (typeof log.warn === 'function' ? log.warn(message) : console.warn(message));
+  const info = (message) => (typeof log.info === 'function' ? log.info(message) : console.info(message));
+
+  const home = getHarnessHome();
+  const config = rawConfig ?? {};
+  const stateFile = typeof config.stateFile === 'string' && config.stateFile !== ''
+    ? config.stateFile
+    : join(home, 'issue-fixer-state.json');
+  const defaults = normalizeSettings(config);
+
+  let state = null;
+  let settings = null;
+  let token = null; // in-memory only, never returned to the browser
+  let tokenFromUi = false; // a pasted token is the only one worth persisting
+  let report = null; // last verification report
+  let timerStop = null;
+  let polling = false;
+  let disposed = false;
+  let started = false;
+  const queue = [];
+  let agentModules;
+
+  // ---------------------------------------------------------------- state io
+
+  async function persist() {
+    if (!state) return;
+    try {
+      state.settings = settings
+        ? { ...settings, githubToken: tokenFromUi ? settings.githubToken : '' }
+        : null;
+      if (state.settings) state.tokenStored = tokenFromUi;
+      await saveState(stateFile, state);
+    } catch (error) {
+      warn(`issue-fixer: cannot write ${stateFile}: ${String(error)}`);
+    }
+  }
+
+  // ------------------------------------------------------------- verification
+
+  function publicSettings(candidate = settings) {
+    return {
+      repo: candidate?.repo ?? '',
+      cwd: candidate?.cwd ?? '',
+      intervalMs: candidate?.intervalMs ?? DEFAULT_INTERVAL_MS,
+      labels: candidate?.labels ?? [],
+      tokenSource: candidate?.githubToken ? 'stored' : 'gh-cli',
+    };
+  }
+
+  function missingReport(candidate) {
+    return {
+      phase: 'setup-required',
+      problems: settingsProblems(candidate),
+      required: REQUIRED_FIELDS,
+      identity: null,
+      access: null,
+      checkout: null,
+      verifiedAt: null,
+    };
+  }
+
+  /**
+   * Run every gate: required fields → logged-in account → repository write
+   * access → matching local checkout. The returned report carries an
+   * `internal` field with the token; it is stripped before it reaches HTTP.
+   */
+  async function verify(candidate) {
+    if (!isConfigured(candidate)) return missingReport(candidate);
+
+    const identity = await resolveIdentity({ githubToken: candidate.githubToken });
+    const result = {
+      phase: 'blocked',
+      problems: [],
+      required: REQUIRED_FIELDS,
+      identity: identity.ok
+        ? { ok: true, login: identity.login, source: identity.source }
+        : { ok: false, error: identity.error },
+      access: null,
+      checkout: null,
+      verifiedAt: null,
+    };
+    if (!identity.ok) return result;
+
+    const access = await checkRepoAccess(identity.token, candidate.repo);
+    result.access = access.ok
+      ? {
+        ok: true,
+        repo: access.repo,
+        private: access.private,
+        defaultBranch: access.defaultBranch,
+        permissions: access.permissions,
+        owner: access.owner,
+      }
+      : { ok: false, error: access.error, repo: candidate.repo };
+    if (!access.ok) return result;
+
+    const checkout = await checkCheckout({ cwd: candidate.cwd, repo: access.repo });
+    result.checkout = {
+      ok: checkout.ok,
+      checks: checkout.checks,
+      branch: checkout.branch ?? null,
+      dirty: checkout.dirty ?? 0,
+      topLevel: checkout.topLevel ?? null,
+    };
+    if (!checkout.ok) {
+      const failing = checkout.checks.find((check) => !check.ok && check.id !== 'clean' && check.id !== 'identity');
+      result.access.error = undefined;
+      result.error = failing?.detail ?? 'The working directory is not usable.';
+      return result;
+    }
+
+    result.phase = 'ready';
+    result.verifiedAt = nowIso();
+    result.internal = { token: identity.token, login: identity.login, repo: access.repo };
+    return result;
+  }
+
+  function publicStatus() {
+    return {
+      phase: report?.phase ?? 'starting',
+      problems: report?.problems ?? [],
+      required: REQUIRED_FIELDS,
+      settings: publicSettings(),
+      identity: report?.identity ?? null,
+      access: report?.access ?? null,
+      checkout: report?.checkout ?? null,
+      verifiedAt: report?.verifiedAt ?? null,
+      error: report?.error ?? null,
+      limits: { minIntervalMs: MIN_INTERVAL_MS, defaultIntervalMs: DEFAULT_INTERVAL_MS },
+      activity: {
+        baseline: state?.baseline ?? null,
+        lastPollAt: state?.lastPollAt ?? null,
+        lastError: state?.lastError ?? null,
+        ...summarizeProcessed(state?.processed ?? {}),
+      },
+      stateFile,
+    };
+  }
+
+  // ---------------------------------------------------------------- watching
+
+  function makeInterval(callback, intervalMs) {
+    // `ctx.interval` needs the `timer` service declared in `inject`; this plugin
+    // keeps `inject = []` so the setup screen loads even when agent services are
+    // missing, so fall back to a plain timer that `stopWatching` can clear.
+    try {
+      if (typeof ctx.interval === 'function') return ctx.interval(callback, intervalMs);
+    } catch {
+      // fall through to the plain timer below
+    }
+    const id = setInterval(callback, intervalMs);
+    if (typeof id?.unref === 'function') id.unref();
+    return () => clearInterval(id);
+  }
+
+  function stopWatching() {
+    if (timerStop) {
+      try {
+        timerStop();
+      } catch {
+        // timer already gone
+      }
+      timerStop = null;
+    }
+  }
+
+  function startWatching() {
+    stopWatching();
+    if (disposed || report?.phase !== 'ready') return;
+    token = report.internal.token;
+    timerStop = makeInterval(() => void poll(), settings.intervalMs);
+    void poll();
+    info(`issue-fixer: watching ${settings.repo} in ${settings.cwd} every ${Math.round(settings.intervalMs / 60000)} min as ${report.internal.login}`);
+  }
+
+  async function fetchOpenIssues() {
+    const url = `https://api.github.com/repos/${settings.repo}/issues?state=open&per_page=30&sort=created&direction=desc`;
+    const headers = {
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+      'User-Agent': 'dsh-issue-fixer',
+    };
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const res = await fetch(url, { headers, signal: AbortSignal.timeout(20000) });
+    if (!res.ok) throw new Error(`GitHub API ${res.status}`);
+    const items = await res.json();
+    if (!Array.isArray(items)) throw new Error('GitHub API returned a non-list body');
+    return items;
+  }
+
+  async function revalidate() {
+    report = await verify(settings);
+    if (report.phase !== 'ready') {
+      warn(`issue-fixer: stopped — ${report.identity?.error ?? report.access?.error ?? report.error ?? 'setup incomplete'}`);
+      stopWatching();
+      await persist();
+    } else {
+      token = report.internal.token;
+    }
+    return report;
+  }
+
+  async function poll() {
+    if (polling || disposed) return;
+    if (!settings || report?.phase !== 'ready') return;
+    polling = true;
+    try {
+      const items = await fetchOpenIssues();
+      const maxNumber = items.reduce((max, item) => Math.max(max, item.number ?? 0), 0);
+      const repoKey = settings.repo.toLowerCase();
+      if (!state.baseline || String(state.baseline.repo ?? '').toLowerCase() !== repoKey) {
+        state.baseline = { repo: settings.repo, number: maxNumber };
+        state.lastPollAt = nowIso();
+        state.lastError = null;
+        await persist();
+        info(`issue-fixer: baseline for ${settings.repo}: ignoring issues <= #${maxNumber}`);
+        return;
+      }
+      const fresh = items
+        .filter((item) => wantedIssue(item, settings) && item.number > state.baseline.number
+          && state.processed[item.number] === undefined)
+        .sort((a, b) => a.number - b.number);
+      for (const issue of fresh) queue.push(issue);
+      if (maxNumber > state.baseline.number) state.baseline.number = maxNumber;
+      state.lastPollAt = nowIso();
+      state.lastError = null;
+      await persist();
+      if (fresh.length > 0) {
+        info(`issue-fixer: queued ${fresh.map((issue) => `#${issue.number}`).join(', ')} from ${settings.repo}`);
+      }
+      await drain();
+    } catch (error) {
+      state.lastError = String(error);
+      warn(`issue-fixer: poll failed: ${String(error)}`);
+      await persist();
+      if (/\b401\b|Bad credentials/i.test(String(error))) void revalidate();
+    } finally {
+      polling = false;
+    }
+  }
+
+  // ------------------------------------------------------------ fix sessions
+
+  async function loadAgentModules() {
+    if (!agentModules) {
+      const [agentPkg, llmPkg] = await Promise.all([
+        import('@deepseek-ai/dsh-agent'),
+        import('@deepseek-ai/dsh-llm'),
+      ]);
+      agentModules = { installModelSelection: agentPkg.installModelSelection, createUserMessage: llmPkg.createUserMessage };
+    }
+    return agentModules;
+  }
+
+  // Sequential only: parallel fix sessions in one checkout would fight over the
+  // same files and build directory. Queue or a worktree pool if volume needs it.
+  async function runFixSession(issue) {
+    const agents = ctx.get?.('agents');
+    const sessions = ctx.get?.('sessions');
+    if (!agents || !sessions) {
+      throw new Error('agent services (agents/sessions) are unavailable in this profile; cannot start a fix session');
+    }
+    const { installModelSelection, createUserMessage } = await loadAgentModules();
+    const selectionService = ctx.get?.('agentDefaultModel');
+    const selection = selectionService?.currentSelection?.() ?? {};
+
+    const slug = `${settings.repo.replace(/[^\w.-]/g, '-')}-${issue.number}`;
+    const baseOptions = {
+      agentOptions: { provider: selection.provider, model: selection.model },
+      meta: { cwd: settings.cwd },
+      setup: (agentCtx) => installModelSelection(agentCtx, { current: selection, assembled: undefined }),
+    };
+    let sessionId = `session-issuefix-${slug}`;
+    let handle;
+    try {
+      handle = await agents.create({ sessionId, ...baseOptions });
+    } catch (error) {
+      warn(`issue-fixer: session id "${sessionId}" taken (${String(error)}); minting a new one`);
+      sessionId = `session-issuefix-${randomUUID()}`;
+      handle = await agents.create({ sessionId, ...baseOptions });
+    }
+
+    const agent = handle.agent;
+    await agent.whenIdle();
+
+    let failure;
+    const stopErrors = ctx.on('agent/error', ({ agent: subject, error }) => {
+      if (subject === agent) failure = error;
+    });
+    try {
+      agent.followup(createUserMessage({
+        content: [{ type: 'text', text: taskPrompt(settings, issue) }],
+        source: { kind: 'user' },
+      }));
+      const subagents = ctx.get?.('subagents');
+      for (;;) {
+        await agent.whenIdle();
+        const idleSeq = agent.session.seq;
+        // eslint-disable-next-line no-await-in-loop
+        if (!(await subagents?.waitForChildren(agent)) && agent.status === 'idle' && agent.session.seq === idleSeq) break;
+      }
+      await sessions.flush(agent.session);
+      if (failure !== undefined) throw failure instanceof Error ? failure : new Error(String(failure));
+    } finally {
+      stopErrors();
+    }
+    return sessionId;
+  }
+
+  async function drain() {
+    while (queue.length > 0 && !disposed) {
+      const issue = queue.shift();
+      try {
+        const sessionId = await runFixSession(issue);
+        state.processed[issue.number] = { sessionId, at: nowIso(), status: 'done' };
+        info(`issue-fixer: ${settings.repo}#${issue.number} fix session ${sessionId} finished`);
+      } catch (error) {
+        state.processed[issue.number] = { at: nowIso(), status: 'failed', error: String(error) };
+        warn(`issue-fixer: fix session for ${settings.repo}#${issue.number} failed: ${String(error)}`);
+      }
+      await persist();
+    }
+  }
+
+  // -------------------------------------------------------------- HTTP seam
+
+  function jsonResponse(status, body) {
+    return new Response(JSON.stringify(body), {
+      status,
+      headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+    });
+  }
+
+  function route(handler) {
+    return async (request) => {
+      try {
+        return await handler(request);
+      } catch (error) {
+        return jsonResponse(400, { error: String(error?.message ?? error) });
+      }
+    };
+  }
+
+  async function readBody(request) {
+    const text = await request.text();
+    if (text === '') return {};
+    if (text.length > BODY_LIMIT_BYTES) throw new Error('request body is too large');
+    try {
+      const parsed = JSON.parse(text);
+      return parsed !== null && typeof parsed === 'object' ? parsed : {};
+    } catch {
+      throw new Error('request body is not valid JSON');
+    }
+  }
+
+  /** Build the settings a request would save, keeping the stored token unless replaced. */
+  function candidateFrom(body) {
+    const base = settings ?? normalizeSettings({});
+    const minutes = Number(body.intervalMinutes);
+    const intervalMs = Number.isFinite(minutes) && minutes > 0
+      ? Math.max(MIN_INTERVAL_MS, Math.round(minutes * 60000))
+      : base.intervalMs;
+    let githubToken = base.githubToken;
+    if (body.useGhCli === true) githubToken = '';
+    else if (typeof body.githubToken === 'string' && body.githubToken.trim() !== '') githubToken = body.githubToken.trim();
+    return {
+      settings: normalizeSettings({
+        repo: typeof body.repo === 'string' ? body.repo : base.repo,
+        cwd: typeof body.cwd === 'string' ? body.cwd : base.cwd,
+        intervalMs,
+        labels: Array.isArray(body.labels) ? body.labels : base.labels,
+        githubToken,
+      }),
+      tokenFromUi: body.useGhCli === true ? false : (typeof body.githubToken === 'string' && body.githubToken.trim() !== '') || tokenFromUi,
+    };
+  }
+
+  async function statusRoute() {
+    return jsonResponse(200, publicStatus());
+  }
+
+  async function checkRoute(request) {
+    const candidate = candidateFrom(await readBody(request));
+    const checked = await verify(candidate.settings);
+    const { internal, ...visible } = checked;
+    return jsonResponse(200, { ...visible, settings: publicSettings(candidate.settings), activity: publicStatus().activity });
+  }
+
+  async function saveRoute(request) {
+    const candidate = candidateFrom(await readBody(request));
+    const checked = await verify(candidate.settings);
+    if (checked.phase !== 'ready') {
+      const { internal, ...visible } = checked;
+      return jsonResponse(409, { ...visible, settings: publicSettings(candidate.settings) });
+    }
+    if (!state) state = { settings: null, processed: {}, baseline: null };
+    settings = candidate.settings;
+    tokenFromUi = candidate.tokenFromUi;
+    settings.repo = checked.internal.repo; // adopt upstream spelling
+    report = checked;
+    state.identity = { login: checked.internal.login, source: checked.identity.source, verifiedAt: checked.verifiedAt };
+    if (!state.baseline || String(state.baseline.repo ?? '').toLowerCase() !== settings.repo.toLowerCase()) {
+      state.baseline = null; // a new repository gets a fresh baseline
+    }
+    await persist();
+    startWatching();
+    info(`issue-fixer: setup saved — watching ${settings.repo}`);
+    return jsonResponse(200, { saved: true, status: publicStatus() });
+  }
+
+  async function resetRoute() {
+    stopWatching();
+    settings = normalizeSettings(defaults);
+    token = null;
+    tokenFromUi = false;
+    report = missingReport(settings);
+    if (state) {
+      state.settings = null;
+      state.identity = null;
+      state.baseline = null;
+      state.lastError = null;
+      await persist();
+    }
+    return jsonResponse(200, { reset: true, status: publicStatus() });
+  }
+
+  // `requestBody: 'buffered'` is required even for GET: without it the bridge
+  // treats the request as streaming and a bodyless GET fails with 400.
+  const ROUTES = [
+    { path: `${ROUTE_PREFIX}.status`, methods: ['GET'], requestBody: 'buffered', fetch: route(statusRoute) },
+    { path: `${ROUTE_PREFIX}.check`, methods: ['POST'], requestBody: 'buffered', fetch: route(checkRoute) },
+    { path: `${ROUTE_PREFIX}.save`, methods: ['POST'], requestBody: 'buffered', fetch: route(saveRoute) },
+    { path: `${ROUTE_PREFIX}.reset`, methods: ['POST'], requestBody: 'buffered', fetch: route(resetRoute) },
+  ];
+
+  // --------------------------------------------------------------- lifecycle
+
+  ctx.effect(() => {
+    void (async () => {
+      try {
+        state = await loadState(stateFile);
+        settings = settingsFromState(state, defaults);
+        tokenFromUi = state.tokenStored === true;
+        report = await verify(settings);
+        if (report.phase === 'ready') {
+          settings.repo = report.internal.repo;
+          state.identity = { login: report.internal.login, source: report.identity.source, verifiedAt: report.verifiedAt };
+          await persist();
+          startWatching();
+        } else {
+          const reason = report.problems[0]?.message
+            ?? report.identity?.error
+            ?? report.access?.error
+            ?? report.error
+            ?? 'setup is incomplete';
+          warn(`issue-fixer: waiting for setup — open Settings → Issue Fixer (${reason})`);
+          await persist();
+        }
+      } catch (error) {
+        warn(`issue-fixer: startup failed: ${String(error)}`);
+      }
+    })();
+    return () => {
+      disposed = true;
+      stopWatching();
+    };
+  }, 'issue-fixer');
+
+  // The setup API rides the authenticated `connection` Fetch registry: every
+  // request is fenced by the Host/Origin check and must come from the browser
+  // owner peer. The raw `webServer` seam has no authentication whatsoever, so it
+  // must never be the door to a GitHub token.
+  ctx.inject(['connection'], (connCtx) => {
+    for (const definition of ROUTES) {
+      connCtx.connection.fetch.register(definition);
+    }
+    info(`issue-fixer: setup API on ${ROUTES.map((item) => item.path).join(', ')}`);
+  });
+}
