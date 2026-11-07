@@ -1,6 +1,6 @@
 {
   "name": "dsh-issue-fixer",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "DeepSeek Harness plugin: watches a GitHub repository and lets an agent fix its open issues, but only for repositories the logged-in account can push to.",
   "license": "MIT",
   "type": "module",
@@ -16,8 +16,7 @@
       "patch": "./cordis.patch.yml"
     },
     "client": {
-      "platform": "web",
-      "inject": ["slots", "locale"]
+      "platform": "web"
     }
   },
   "files": [
