@@ -386,6 +386,15 @@ export function apply(ctx, rawConfig = {}) {
 
   // ------------------------------------------------------------ fix sessions
 
+  /** Commits added on `branch` relative to `base`; null when git cannot tell. */
+  async function commitsAhead(cwd, base, branch) {
+    if (!base) return null;
+    const range = await git(cwd, ['rev-list', '--count', `${base}..${branch}`]);
+    if (!range.ok) return null;
+    const count = Number(range.stdout);
+    return Number.isFinite(count) ? count : null;
+  }
+
   async function loadAgentModules() {
     if (!agentModules) {
       const [agentPkg, llmPkg] = await Promise.all([
@@ -436,14 +445,27 @@ export function apply(ctx, rawConfig = {}) {
     const selectionService = ctx.get?.('agentDefaultModel');
     const selection = selectionService?.currentSelection?.() ?? {};
 
+    // A preset decides which tools and prompt sections an agent gets. Without
+    // one the session has no tools at all ("unknown tool" for every call), so
+    // mount the current default preset like the host's own webhook path does.
+    const presets = ctx.get?.('agentPresets');
+    const presetId = presets?.defaultId;
+    if (!presets) {
+      throw new Error('agentPresets service is unavailable in this profile, so the fix session would have no tools');
+    }
+    if (!presetId) {
+      throw new Error('agentPresets service has no default preset; cannot mount tools for the fix session');
+    }
+
     const slug = `${settings.repo.replace(/[^\w.-]/g, '-')}-${issue.number}`;
     const baseOptions = {
       agentOptions: { provider: selection.provider, model: selection.model },
-      meta: { cwd: settings.cwd },
+      meta: { cwd: settings.cwd, ...(presetId ? { agentPreset: presetId } : {}) },
       // The agents service calls `(await setup(...))?.commit()`, so this must
       // return nothing: installModelSelection returns a disposer function,
       // and a truthy value there makes the host call `.commit()` on it.
-      setup: (agentCtx) => {
+      setup: async (agentCtx) => {
+        if (presets && presetId) await presets.mount(agentCtx, presetId);
         const dispose = installModelSelection(agentCtx, { current: selection, assembled: undefined });
         if (typeof agentCtx?.effect === 'function') {
           agentCtx.effect(() => dispose, 'issue-fixer:model-selection');
@@ -487,8 +509,13 @@ export function apply(ctx, rawConfig = {}) {
     } finally {
       stopErrors();
     }
-    const pr = settings.autoPr === true ? await pushAndOpenPr(branch.branch, issue, sessionId) : null;
-    return { sessionId, branch: branch.branch, pr };
+    // Nothing committed means the run changed nothing (tool-less agent, refusal,
+    // or a no-op fix); never push and never report it as a success.
+    const commits = await commitsAhead(settings.cwd, baseBranch, branch.branch);
+    const pr = settings.autoPr === true && commits !== 0
+      ? await pushAndOpenPr(branch.branch, issue, sessionId)
+      : null;
+    return { sessionId, branch: branch.branch, pr, commits };
   }
 
   async function drain() {
@@ -496,13 +523,19 @@ export function apply(ctx, rawConfig = {}) {
       const issue = queue.shift();
       running = issue;
       try {
-        const { sessionId, branch, pr } = await runFixSession(issue);
+        const { sessionId, branch, pr, commits } = await runFixSession(issue);
+        // A session that produced no commit changed nothing; calling that "done"
+        // hides a tool-less or no-op run. Treat it as a failed attempt.
+        if (commits === 0) {
+          throw new Error('the fix session committed nothing — the agent could not change the checkout (missing tools or refusal)');
+        }
         state.processed[issue.number] = {
           sessionId,
           branch,
           title: issue.title,
           at: nowIso(),
           status: 'done',
+          ...(commits ? { commits } : {}),
           ...(pr ? (pr.ok ? { prUrl: pr.url } : { prError: pr.error }) : {}),
         };
         info(`issue-fixer: ${settings.repo}#${issue.number} fix session ${sessionId} finished`);

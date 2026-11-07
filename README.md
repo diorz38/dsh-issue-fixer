@@ -95,7 +95,8 @@ until it has three attempts; a successful one is never repeated.
 ## What the agent is asked to do
 
 For each issue the plugin creates a session (`session-issuefix-<owner>_<name>-<number>`) with the profile's
-default model, working in the configured checkout, and asks the agent to:
+default model and default agent preset — the preset is what supplies the agent's tools — working in the
+configured checkout, and asks the agent to:
 
 1. read the issue and reproduce the problem,
 2. fix it,
@@ -110,7 +111,9 @@ on its own, never merges, never deletes branches. The task prompt also forbids t
 committing to the main/master/default branch or switching branches — every commit must land on the
 fix branch.
 
-The agent itself never pushes and never comments on the issue. With auto pull requests **off**
+The agent itself never pushes and never comments on the issue. A session that leaves no commit on the
+fix branch counts as a failed attempt — the plugin does not push it and does not report it as done.
+With auto pull requests **off**
 (default) you review the fix branch and push it yourself. With auto pull requests **on**, after
 each finished session the plugin pushes the fix branch to the remote that points at the watched
 repository and opens a pull request titled `Fix #<number>: <title>` with a `Fixes #<number>`
