@@ -4,8 +4,10 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH) plug
 open issues of **one** GitHub repository and lets a DSH agent work on them — but only for repositories
 the machine's logged-in GitHub account can actually write to.
 
-The plugin never touches GitHub for you: it reads issues through the GitHub API, then asks a DSH agent
-to fix, test and **commit locally**. It does not push, open pull requests, or comment on issues.
+The plugin never touches GitHub for you beyond reading issues: it asks a DSH agent
+to fix, test and **commit locally**. By default it does not push and does not open
+pull requests — you review and push. If you enable **auto pull requests**, it pushes
+each fix branch and opens the PR for you. It never comments on issues.
 
 ## What it guarantees before it starts
 
@@ -77,6 +79,7 @@ Open **Settings → Issue Fixer** and fill in:
 3. **Poll interval** (minutes, minimum 1) and optional **labels** (an issue must carry every label to be
    picked up).
 4. Choose **Use the GitHub CLI login on this machine** or paste a **token**.
+5. Optionally tick **After each fix: push the branch and open a pull request automatically**.
 
 Press **Check access** to see the full report without saving, then **Save and start watching**. Saving is
 only accepted when every blocking gate passes.
@@ -101,8 +104,12 @@ never stack on each other; a name collision (re-run of the same issue) gets a sh
 checkout is left on the fix branch for you to review and merge or delete. The plugin never switches back
 on its own, never merges, never deletes branches.
 
-It is explicitly told not to push, not to open pull requests and not to comment on the issue. You review
-and push.
+The agent itself never pushes and never comments on the issue. With auto pull requests **off**
+(default) you review the fix branch and push it yourself. With auto pull requests **on**, after
+each finished session the plugin pushes the fix branch to the remote that points at the watched
+repository and opens a pull request titled `Fix #<number>: <title>` with a `Fixes #<number>`
+body, so merging closes the issue. A push or PR failure is reported in the activity feed and the
+warning log — the local fix commits are never lost.
 
 ## State and files
 

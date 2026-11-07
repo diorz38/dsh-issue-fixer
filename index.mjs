@@ -12,8 +12,8 @@ import { randomUUID } from 'node:crypto';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { resolveIdentity, checkRepoAccess } from './github.mjs';
-import { checkCheckout, prepareFixBranch } from './repo.mjs';
+import { resolveIdentity, checkRepoAccess, createPullRequest } from './github.mjs';
+import { checkCheckout, git, prepareFixBranch } from './repo.mjs';
 import {
   DEFAULT_INTERVAL_MS,
   MIN_INTERVAL_MS,
@@ -74,7 +74,9 @@ function taskPrompt(settings, issue) {
     'A dedicated fix branch has already been checked out for this issue; commit your work to it.',
     'Steps: verify or reproduce the issue, implement the smallest safe fix, add a regression',
     'test if feasible, run the repository quality gates, then commit locally with a descriptive',
-    'message. Do not push, open a PR, or comment on the issue.',
+    settings.autoPr
+      ? 'message. Do not push or open a pull request yourself; the plugin pushes the branch and opens the PR.'
+      : 'message. Do not push, open a PR, or comment on the issue.',
   ].join('\n');
 }
 
@@ -112,6 +114,8 @@ export function apply(ctx, rawConfig = {}) {
   let polling = false;
   // Branch fixes are cut from; captured when watching starts, never a fix branch itself.
   let baseBranch = null;
+  // Remote fix branches are pushed to when autoPr is on; the one pointing at the watched repo.
+  let pushRemote = 'origin';
   let disposed = false;
   let started = false;
   const queue = [];
@@ -141,6 +145,7 @@ export function apply(ctx, rawConfig = {}) {
       intervalMs: candidate?.intervalMs ?? DEFAULT_INTERVAL_MS,
       labels: candidate?.labels ?? [],
       tokenSource: candidate?.githubToken ? 'stored' : 'gh-cli',
+      autoPr: candidate?.autoPr === true,
     };
   }
 
@@ -198,6 +203,7 @@ export function apply(ctx, rawConfig = {}) {
       branch: checkout.branch ?? null,
       dirty: checkout.dirty ?? 0,
       topLevel: checkout.topLevel ?? null,
+      remotes: checkout.remotes ?? [],
     };
     if (!checkout.ok) {
       const failing = checkout.checks.find((check) => !check.ok && check.id !== 'clean' && check.id !== 'identity');
@@ -267,6 +273,8 @@ export function apply(ctx, rawConfig = {}) {
     token = report.internal.token;
     const current = report.checkout?.branch ?? null;
     if (current && !current.startsWith('issuefix/')) baseBranch = current;
+    const remote = (report.checkout?.remotes ?? []).find((r) => r.repo?.toLowerCase() === settings.repo.toLowerCase());
+    if (remote) pushRemote = remote.name;
     timerStop = makeInterval(() => void poll(), settings.intervalMs);
     void poll();
     info(`issue-fixer: watching ${settings.repo} in ${settings.cwd} every ${Math.round(settings.intervalMs / 60000)} min as ${report.internal.login}`);
@@ -353,6 +361,24 @@ export function apply(ctx, rawConfig = {}) {
 
   // Sequential only: parallel fix sessions in one checkout would fight over the
   // same files and build directory. Queue or a worktree pool if volume needs it.
+  /**
+   * Push the fix branch and open a PR against the base branch. Failure is a
+   * report, not a throw: the agent's fix commits already exist locally.
+   */
+  async function pushAndOpenPr(branch, issue, sessionId) {
+    const remote = pushRemote || 'origin';
+    const pushed = await git(settings.cwd, ['push', remote, branch]);
+    if (!pushed.ok) return { ok: false, error: `git push ${remote} ${branch} failed: ${pushed.error}` };
+    if (!token) return { ok: false, error: 'no GitHub token in memory; cannot open the PR' };
+    return createPullRequest(token, {
+      repo: settings.repo,
+      title: `Fix #${issue.number}: ${issue.title}`,
+      body: [`Fixes #${issue.number}`, '', `Automated fix by dsh-issue-fixer session \`${sessionId}\`.`].join('\n'),
+      head: branch,
+      base: baseBranch ?? undefined,
+    });
+  }
+
   async function runFixSession(issue) {
     const agents = ctx.get?.('agents');
     const sessions = ctx.get?.('sessions');
@@ -412,16 +438,24 @@ export function apply(ctx, rawConfig = {}) {
     } finally {
       stopErrors();
     }
-    return { sessionId, branch: branch.branch };
+    const pr = settings.autoPr === true ? await pushAndOpenPr(branch.branch, issue, sessionId) : null;
+    return { sessionId, branch: branch.branch, pr };
   }
 
   async function drain() {
     while (queue.length > 0 && !disposed) {
       const issue = queue.shift();
       try {
-        const { sessionId, branch } = await runFixSession(issue);
-        state.processed[issue.number] = { sessionId, branch, at: nowIso(), status: 'done' };
+        const { sessionId, branch, pr } = await runFixSession(issue);
+        state.processed[issue.number] = {
+          sessionId,
+          branch,
+          at: nowIso(),
+          status: 'done',
+          ...(pr ? (pr.ok ? { prUrl: pr.url } : { prError: pr.error }) : {}),
+        };
         info(`issue-fixer: ${settings.repo}#${issue.number} fix session ${sessionId} finished`);
+        if (pr && !pr.ok) warn(`issue-fixer: ${settings.repo}#${issue.number} PR failed: ${pr.error}`);
       } catch (error) {
         state.processed[issue.number] = { at: nowIso(), status: 'failed', error: String(error) };
         warn(`issue-fixer: fix session for ${settings.repo}#${issue.number} failed: ${String(error)}`);
@@ -478,6 +512,7 @@ export function apply(ctx, rawConfig = {}) {
         intervalMs,
         labels: Array.isArray(body.labels) ? body.labels : base.labels,
         githubToken,
+        autoPr: typeof body.autoPr === 'boolean' ? body.autoPr : base.autoPr,
       }),
       tokenFromUi: body.useGhCli === true ? false : (typeof body.githubToken === 'string' && body.githubToken.trim() !== '') || tokenFromUi,
     };

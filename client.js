@@ -57,6 +57,7 @@ window.__ModuleLoader__.load({
         labels: (settings.labels || []).join(", "),
         useGhCli: (settings.tokenSource || "gh-cli") !== "stored",
         token: "",
+        autoPr: settings.autoPr === true,
       };
     }
 
@@ -71,6 +72,7 @@ window.__ModuleLoader__.load({
           .filter(Boolean),
         useGhCli: draft.useGhCli === true,
         githubToken: draft.useGhCli === true ? "" : draft.token,
+        autoPr: draft.autoPr === true,
       };
     }
 
@@ -408,7 +410,10 @@ window.__ModuleLoader__.load({
           if (act.lastError) rows.push(row("Last error", h("span", { style: S.mono }, act.lastError)));
           if (act.recent && act.recent.length > 0) {
             rows.push(row("Recent", h("div", { style: S.mono }, act.recent.map(function (item) {
-              return "#" + item.number + " " + (item.status || "?") + (item.sessionId ? " · " + item.sessionId : "");
+              return "#" + item.number + " " + (item.status || "?")
+                + (item.branch ? " · " + item.branch : "")
+                + (item.prUrl ? " · PR opened" : "")
+                + (item.prError ? " · PR failed" : "");
             }).join("\n"))));
           }
           activity = h("div", { style: S.card }, h("h3", { style: S.cardTitle }, "Activity"), rows);
@@ -451,6 +456,12 @@ window.__ModuleLoader__.load({
                 ? null
                 : field("Token", "classic or fine-grained token with repository read/write permission",
                   h("input", { style: S.input, type: "password", autoComplete: "off", value: draft.token, placeholder: "ghp_…", disabled: disabled, onChange: function (event) { edit({ token: event.target.value }); } })),
+              h(
+                "label",
+                { style: { display: "flex", gap: 8, alignItems: "center" } },
+                h("input", { type: "checkbox", checked: draft.autoPr === true, disabled: disabled, onChange: function (event) { edit({ autoPr: event.target.checked }); } }),
+                h("span", {}, "After each fix: push the branch and open a pull request automatically"),
+              ),
               h("p", { style: S.hint }, "The plugin only runs when this account owns the repository or has push, maintain or admin access. Read-only clones are rejected."),
             ),
             h(

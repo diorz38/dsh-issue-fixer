@@ -55,6 +55,7 @@ export function normalizeSettings(raw = {}) {
       ? raw.labels.map((label) => String(label).trim()).filter(Boolean)
       : [],
     githubToken: typeof raw.githubToken === 'string' ? raw.githubToken.trim() : '',
+    autoPr: raw.autoPr === true,
   };
   return settings;
 }

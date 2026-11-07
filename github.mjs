@@ -33,6 +33,23 @@ export async function ghGet(path, token) {
   return { ok: res.ok, status: res.status, body };
 }
 
+/** GitHub API POST returning { ok, status, body }. Never throws on HTTP status. */
+export async function ghPost(path, token, body) {
+  const res = await fetch(`${API}${path}`, {
+    method: 'POST',
+    headers: { ...apiHeaders(token), 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(TIMEOUT_MS),
+  });
+  let parsed = null;
+  try {
+    parsed = await res.json();
+  } catch {
+    parsed = null;
+  }
+  return { ok: res.ok, status: res.status, body: parsed };
+}
+
 // `util.promisify(execFile)` silently loses its multi-value contract when the
 // host patches `child_process.execFile` (Windows desktop builds do, to hide
 // console windows), so wrap the callback form explicitly instead.
@@ -172,4 +189,17 @@ export async function checkRepoAccess(token, repo) {
     permissions,
     owner: body.owner?.login ?? null,
   };
+}
+
+/**
+ * Open a pull request from a pushed fix branch. Write access was already
+ * verified by checkRepoAccess, so a failure here is reported, not thrown.
+ */
+export async function createPullRequest(token, { repo, title, body, head, base }) {
+  const { ok, status, body: created } = await ghPost(`/repos/${repo}/pulls`, token, { title, body, head, base });
+  if (!ok) {
+    const first = Array.isArray(created?.errors) && created.errors[0]?.message ? ` (${created.errors[0].message})` : '';
+    return { ok: false, error: `PR create failed: ${created?.message ?? `HTTP ${status}`}${first}` };
+  }
+  return { ok: true, url: created.html_url ?? null, number: created.number ?? null };
 }
