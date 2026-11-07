@@ -48,6 +48,12 @@ Then add the bundle to the profile manifest `profiles\web\package.json`:
 
 Restart DSH Desktop. The plugin inserts itself through its own `cordis.patch.yml`.
 
+Pin a release instead of tracking `main` by appending the tag:
+
+```powershell
+pnpm add "github:diorz38/dsh-issue-fixer#v0.3.0"
+```
+
 ### Option 2 — point the profile at a checkout (no pnpm)
 
 Clone the repository anywhere and add an insert to `profiles\web\cordis.patch.yml`:
