@@ -427,6 +427,43 @@ window.__ModuleLoader__.load({
           activity = h("div", { style: S.card }, h("h3", { style: S.cardTitle }, "Activity"), rows);
         }
 
+        // -- detected issues: running + queued + processed, with issue/PR links
+        var issuesCard = null;
+        if (status && status.activity) {
+          var act2 = status.activity;
+          var repoName = (status.settings && status.settings.repo) || "";
+          var issueUrl = function (item) {
+            return repoName ? "https://github.com/" + repoName + "/issues/" + item.number : null;
+          };
+          var link = function (href, text) {
+            return h("a", { href: href, target: "_blank", rel: "noreferrer", style: { color: "inherit" } }, text);
+          };
+          var issueRows = [];
+          if (act2.running) {
+            issueRows.push(h("div", { style: S.mono },
+              "#" + act2.running.number + " " + (act2.running.title || "") + " · fixing…",
+              issueUrl(act2.running) ? [" ", link(issueUrl(act2.running), "issue")] : null));
+          }
+          (act2.queue || []).forEach(function (item) {
+            issueRows.push(h("div", { style: S.mono },
+              "#" + item.number + " " + (item.title || "") + " · queued",
+              issueUrl(item) ? [" ", link(issueUrl(item), "issue")] : null));
+          });
+          (act2.issues || []).slice(0, 50).forEach(function (item) {
+            issueRows.push(h("div", { style: S.mono },
+              "#" + item.number + " " + (item.title ? item.title + " · " : "") + (item.status || "?")
+                + (item.branch ? " · " + item.branch : ""),
+              " ",
+              issueUrl(item) ? link(issueUrl(item), "issue") : null,
+              item.prUrl ? [" · ", link(item.prUrl, "PR")] : null,
+              item.prError ? " · PR failed" : null));
+          });
+          if (issueRows.length > 0) {
+            issuesCard = h("div", { style: S.card },
+              h("h3", { style: S.cardTitle }, "Issues (" + issueRows.length + ")"), issueRows);
+          }
+        }
+
         var form = draft
           ? h(
             "div",
@@ -498,6 +535,7 @@ window.__ModuleLoader__.load({
           form,
           verdict,
           activity,
+          issuesCard,
           status && status.stateFile ? h("p", { style: S.hint }, "State file: " + status.stateFile) : null,
         );
       };

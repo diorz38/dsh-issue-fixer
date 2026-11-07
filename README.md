@@ -113,6 +113,10 @@ repository and opens a pull request titled `Fix #<number>: <title>` with a `Fixe
 body, so merging closes the issue. A push or PR failure is reported in the activity feed and the
 warning log — the local fix commits are never lost.
 
+The settings page also shows an **Issues** card: the issue being fixed right now (`fixing…`),
+queued issues, and every processed issue (newest first, up to 50 rows) with its title, status,
+fix branch and links to the GitHub issue and the opened pull request.
+
 ## State and files
 
 - `<DSH_HOME>\issue-fixer-state.json` — settings, verified identity, per-repository baseline, processed

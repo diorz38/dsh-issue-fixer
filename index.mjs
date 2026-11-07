@@ -84,16 +84,15 @@ function taskPrompt(settings, issue) {
 }
 
 function summarizeProcessed(processed) {
-  const rows = Object.entries(processed)
+  const issues = Object.entries(processed)
     .map(([number, record]) => ({ number: Number(number), ...record }))
-    .sort((a, b) => b.number - a.number)
-    .slice(0, 10);
+    .sort((a, b) => b.number - a.number);
   const counts = { done: 0, failed: 0 };
   for (const record of Object.values(processed)) {
     if (record?.status === 'done') counts.done += 1;
     else if (record?.status === 'failed') counts.failed += 1;
   }
-  return { counts, recent: rows };
+  return { counts, issues };
 }
 
 export function apply(ctx, rawConfig = {}) {
@@ -123,6 +122,7 @@ export function apply(ctx, rawConfig = {}) {
   let disposed = false;
   let started = false;
   const queue = [];
+  let running = null; // issue currently being fixed, surfaced in the status API
   let agentModules;
   let updateInfo = null; // last self-update outcome, surfaced in the status API
   let updateTimer = null;
@@ -241,6 +241,8 @@ export function apply(ctx, rawConfig = {}) {
         baseline: state?.baseline ?? null,
         lastPollAt: state?.lastPollAt ?? null,
         lastError: state?.lastError ?? null,
+        queue: queue.map((issue) => ({ number: issue.number, title: issue.title })),
+        running: running ? { number: running.number, title: running.title } : null,
         ...summarizeProcessed(state?.processed ?? {}),
       },
       update: updateInfo,
@@ -473,6 +475,7 @@ export function apply(ctx, rawConfig = {}) {
   async function drain() {
     while (queue.length > 0 && !disposed) {
       const issue = queue.shift();
+      running = issue;
       try {
         const { sessionId, branch, pr } = await runFixSession(issue);
         state.processed[issue.number] = {
@@ -489,6 +492,7 @@ export function apply(ctx, rawConfig = {}) {
         state.processed[issue.number] = { title: issue.title, at: nowIso(), status: 'failed', error: String(error) };
         warn(`issue-fixer: fix session for ${settings.repo}#${issue.number} failed: ${String(error)}`);
       }
+      running = null;
       await persist();
     }
   }
