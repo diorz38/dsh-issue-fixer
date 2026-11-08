@@ -13,7 +13,7 @@ import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { resolveIdentity, checkRepoAccess, createPullRequest } from './github.mjs';
-import { checkCheckout, git, prepareFixBranch } from './repo.mjs';
+import { checkCheckout, git, prepareFixBranch, syncFork } from './repo.mjs';
 import { selfUpdate } from './update.mjs';
 import {
   DEFAULT_INTERVAL_MS,
@@ -123,9 +123,11 @@ export function apply(ctx, rawConfig = {}) {
   let started = false;
   const queue = [];
   let running = null; // issue currently being fixed, surfaced in the status API
+  let syncing = false; // fork sync in progress, surfaced in the status API
   let agentModules;
   let updateInfo = null; // last self-update outcome, surfaced in the status API
   let updateTimer = null;
+  const AUTO_SYNC_COOLDOWN_MS = 10 * 60 * 1000;
 
   // ---------------------------------------------------------------- state io
 
@@ -154,6 +156,7 @@ export function apply(ctx, rawConfig = {}) {
 
 
   function publicSettings(candidate = settings) {
+    const sync = candidate?.sync ?? {};
     return {
       repo: candidate?.repo ?? '',
       cwd: candidate?.cwd ?? '',
@@ -162,6 +165,18 @@ export function apply(ctx, rawConfig = {}) {
       tokenSource: candidate?.githubToken ? 'stored' : 'gh-cli',
       autoPr: candidate?.autoPr === true,
       autoUpdate: candidate?.autoUpdate !== false,
+      sync: {
+        enabled: sync.enabled === true,
+        upstreamRepo: sync.upstreamRepo ?? '',
+        upstreamRemote: sync.upstreamRemote ?? '',
+        mainBranch: sync.mainBranch ?? '',
+        modBranch: sync.modBranch ?? '',
+        mode: 'merge',
+        trigger: sync.trigger === 'auto' ? 'auto' : 'manual',
+        push: sync.push !== false,
+        minCommitsBehind: Number.isInteger(sync.minCommitsBehind) && sync.minCommitsBehind >= 0 ? sync.minCommitsBehind : 0,
+        conflictResolution: sync.conflictResolution === 'agent' ? 'agent' : 'manual',
+      },
     };
   }
 
@@ -252,8 +267,10 @@ export function apply(ctx, rawConfig = {}) {
         lastError: state?.lastError ?? null,
         queue: queue.map((issue) => ({ number: issue.number, title: issue.title })),
         running: running ? { number: running.number, title: running.title } : null,
+        syncing,
         ...summarizeProcessed(state?.processed ?? {}),
       },
+      sync: state?.sync ?? null,
       update: updateInfo,
       stateFile,
     };
@@ -346,6 +363,132 @@ export function apply(ctx, rawConfig = {}) {
     return report;
   }
 
+  async function finalizeSyncResult(result, reason) {
+    if (!state.sync || typeof state.sync !== 'object') state.sync = {};
+    state.sync.lastRunAt = nowIso();
+    state.sync.lastResult = result.result;
+    state.sync.lastMessage = result.message;
+    state.sync.lastSteps = Array.isArray(result.steps) ? result.steps.slice(-30) : [];
+    state.sync.lastReason = reason;
+    await persist();
+    if (result.ok) info(`issue-fixer: fork sync (${reason}) — ${result.message}`);
+    else warn(`issue-fixer: fork sync (${reason}) ${result.result}: ${result.message}`);
+    return result;
+  }
+
+  async function resolveSyncConflictWithAgent(syncResult, reason) {
+    const handoff = syncResult.handoff;
+    const cwd = handoff?.cwd || settings.cwd;
+    const steps = Array.isArray(syncResult.steps) ? [...syncResult.steps] : [];
+    const step = (ok, label, detail) => steps.push({ ok, label, detail: detail ?? '' });
+    try {
+      info(`issue-fixer: fork sync (${reason}) — resolving merge conflicts on ${handoff.modBranch} with agent`);
+      step(true, 'Agent conflict resolution', `Starting agent session for ${(handoff.conflictedFiles || []).join(', ') || 'conflicted files'} (opt-in).`);
+      const agentRun = await runSyncConflictAgent(handoff);
+      step(true, 'Agent conflict resolution', `Agent session ${agentRun.sessionId} finished.`);
+
+      if (await mergeInProgress(cwd)) {
+        const remaining = await unmergedPaths(cwd);
+        if (remaining && remaining.length > 0) {
+          throw new Error(`Agent finished but unmerged paths remain: ${remaining.join(', ')}`);
+        }
+        const commitMerge = await git(cwd, ['commit', '--no-edit']);
+        if (!commitMerge.ok) {
+          throw new Error(`Agent resolved files but completing the merge commit failed: ${commitMerge.error}`);
+        }
+        step(true, 'Complete merge commit', commitMerge.stdout || 'ok');
+      }
+
+      const remaining = await unmergedPaths(cwd);
+      if (remaining && remaining.length > 0) {
+        throw new Error(`Unmerged paths remain after agent resolution: ${remaining.join(', ')}`);
+      }
+      step(true, 'Verify resolution', 'No unmerged paths remain.');
+
+      if (handoff.push !== false) {
+        const pushedMod = await git(cwd, ['push', handoff.originRemote || 'origin', handoff.modBranch], 60000);
+        if (!pushedMod.ok) {
+          step(false, `Push ${handoff.modBranch} to ${handoff.originRemote || 'origin'}`, pushedMod.error);
+          await restoreSyncBranch(cwd, handoff.restoreBranch);
+          return finalizeSyncResult({
+            ok: false,
+            result: 'error',
+            message: `Resolved ${handoff.modBranch} conflicts locally but failed to push: ${pushedMod.error}`,
+            steps,
+          }, reason);
+        }
+        step(true, `Push ${handoff.modBranch} to ${handoff.originRemote || 'origin'}`, pushedMod.stdout || 'ok');
+      } else {
+        step(true, `Push ${handoff.modBranch}`, 'skipped (push disabled)');
+      }
+
+      await restoreSyncBranch(cwd, handoff.restoreBranch);
+      step(true, 'Restore branch', handoff.restoreBranch ?? handoff.previousBranch ?? 'ok');
+      return finalizeSyncResult({
+        ok: true,
+        result: 'ok',
+        message: `Synced ${handoff.upstreamRef} → ${handoff.mainBranch} → ${handoff.modBranch}; agent resolved merge conflicts${handoff.push !== false ? ` and pushed ${handoff.modBranch}` : ''}.`,
+        steps,
+      }, reason);
+    } catch (error) {
+      const message = String(error);
+      step(false, 'Agent conflict resolution', message);
+      await abortMergeIfNeeded(cwd);
+      await restoreSyncBranch(cwd, handoff.restoreBranch);
+      step(true, 'Recovery', 'Merge aborted (if still in progress) and checkout restored. No changes pushed.');
+      return finalizeSyncResult({
+        ok: false,
+        result: 'conflict',
+        message: `Agent could not safely resolve merge conflicts on ${handoff.modBranch}: ${message}`,
+        steps,
+      }, reason);
+    }
+  }
+
+  async function runForkSync(reason = 'manual') {
+    if (disposed) return { ok: false, result: 'skipped', message: 'Plugin is shutting down.' };
+    if (!settings || report?.phase !== 'ready') return { ok: false, result: 'skipped', message: 'Setup is not ready.' };
+    if (!settings.sync?.enabled) return { ok: false, result: 'skipped', message: 'Fork sync is not enabled.' };
+    if (syncing) return { ok: false, result: 'skipped', message: 'A fork sync is already running.' };
+    if (running || queue.length > 0) {
+      return { ok: false, result: 'skipped', message: 'A fix session is running or queued. Sync after fixes finish to avoid branch conflicts.' };
+    }
+    syncing = true;
+    try {
+      const result = await syncFork({
+        cwd: settings.cwd,
+        watchedRepo: settings.repo,
+        sync: settings.sync,
+        defaultBranch: report?.access?.defaultBranch ?? baseBranch ?? 'main',
+      });
+      if (result.result === 'conflict_needs_agent' && result.handoff) {
+        return await resolveSyncConflictWithAgent(result, reason);
+      }
+      return await finalizeSyncResult(result, reason);
+    } catch (error) {
+      const message = String(error);
+      if (!state.sync || typeof state.sync !== 'object') state.sync = {};
+      state.sync.lastRunAt = nowIso();
+      state.sync.lastResult = 'error';
+      state.sync.lastMessage = message;
+      state.sync.lastSteps = [];
+      state.sync.lastReason = reason;
+      await persist();
+      warn(`issue-fixer: fork sync (${reason}) failed: ${message}`);
+      return { ok: false, result: 'error', message, steps: [] };
+    } finally {
+      syncing = false;
+    }
+  }
+
+  async function maybeAutoSync() {
+    if (!settings?.sync?.enabled || settings.sync.trigger !== 'auto') return;
+    if (running || syncing || queue.length > 0) return;
+    const last = state?.sync?.lastRunAt ? Date.parse(state.sync.lastRunAt) : 0;
+    if (Number.isFinite(last) && last > 0 && Date.now() - last < AUTO_SYNC_COOLDOWN_MS) return;
+    await runForkSync('auto');
+  }
+
   async function poll() {
     if (polling || disposed) return;
     if (!settings || report?.phase !== 'ready') return;
@@ -360,6 +503,7 @@ export function apply(ctx, rawConfig = {}) {
         state.lastError = null;
         await persist();
         info(`issue-fixer: baseline for ${settings.repo}: ignoring issues <= #${maxNumber}`);
+        await maybeAutoSync();
         return;
       }
       const fresh = items
@@ -375,6 +519,7 @@ export function apply(ctx, rawConfig = {}) {
       }
       await drain();
       await repairPendingPrs();
+      await maybeAutoSync();
     } catch (error) {
       state.lastError = String(error);
       warn(`issue-fixer: poll failed: ${String(error)}`);
@@ -450,6 +595,27 @@ export function apply(ctx, rawConfig = {}) {
     return Number.isFinite(count) ? count : null;
   }
 
+  function syncConflictPrompt(handoff) {
+    const files = (handoff.conflictedFiles ?? []).join(', ') || '(unknown)';
+    return [
+      `Resolve a fork-sync merge conflict in ${handoff.cwd}.`,
+      '',
+      `Current state: you are on branch "${handoff.modBranch}" with an in-progress merge of "${handoff.mainBranch}" (upstream synced as "${handoff.upstreamRef}").`,
+      `Conflicted files: ${files}`,
+      '',
+      'Your job:',
+      '1. Open each conflicted file and resolve all merge conflicts. Keep the intent of BOTH sides where they still apply: preserve upstream fixes/changes from the merged branch and preserve local modifications on this modification branch. Do not blindly take one side unless the other side is obsolete.',
+      '2. Remove all conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`).',
+      '3. Run relevant repository checks/tests for the changed area if feasible.',
+      '4. Stage the resolved files and complete the merge commit (`git add -A && git commit --no-edit`, or a clear merge commit message).',
+      '',
+      'Safety rules (must follow):',
+      `- Stay on branch "${handoff.modBranch}". Do not switch branches, do not create branches.`,
+      '- Do not push. Do not use `--force`, `--force-with-lease`, `reset --hard`, or rewrite history.',
+      '- Do not abort the merge unless you are completely unable to make progress after trying; if you abort, explain why clearly.',
+      '- Leave the repository in a clean, merge-completed state with no unmerged paths and no conflict markers.',
+    ].join('\n');
+  }
   async function loadAgentModules() {
     if (!agentModules) {
       const [agentPkg, llmPkg] = await Promise.all([
@@ -459,6 +625,91 @@ export function apply(ctx, rawConfig = {}) {
       agentModules = { installModelSelection: agentPkg.installModelSelection, createUserMessage: llmPkg.createUserMessage };
     }
     return agentModules;
+  }
+
+  async function mergeInProgress(cwd) {
+    const head = await git(cwd, ['rev-parse', '-q', '--verify', 'MERGE_HEAD']);
+    return head.ok && head.stdout.trim() !== '';
+  }
+
+  async function unmergedPaths(cwd) {
+    const r = await git(cwd, ['diff', '--name-only', '--diff-filter=U']);
+    if (!r.ok) return null;
+    return r.stdout ? r.stdout.split('\n').filter(Boolean) : [];
+  }
+
+  async function abortMergeIfNeeded(cwd) {
+    if (await mergeInProgress(cwd)) {
+      await git(cwd, ['merge', '--abort']);
+    }
+  }
+
+  async function restoreSyncBranch(cwd, restoreBranch) {
+    if (restoreBranch) {
+      await git(cwd, ['switch', restoreBranch]);
+    }
+  }
+
+  async function runSyncConflictAgent(handoff) {
+    const agents = ctx.get?.('agents');
+    const sessions = ctx.get?.('sessions');
+    if (!agents || !sessions) {
+      throw new Error('agent services (agents/sessions) are unavailable in this profile; cannot resolve sync conflicts automatically');
+    }
+    const { installModelSelection, createUserMessage } = await loadAgentModules();
+    const selectionService = ctx.get?.('agentDefaultModel');
+    const selection = selectionService?.currentSelection?.() ?? {};
+    const presets = ctx.get?.('agentPresets');
+    const presetId = presets?.defaultId;
+    if (!presets) throw new Error('agentPresets service is unavailable in this profile; cannot mount tools for conflict resolution');
+    if (!presetId) throw new Error('agentPresets service has no default preset; cannot mount tools for conflict resolution');
+
+    const slug = `sync-conflict-${String(handoff.modBranch || 'mod').replace(/[^\w.-]/g, '-')}`;
+    const baseOptions = {
+      agentOptions: { provider: selection.provider, model: selection.model },
+      meta: { cwd: handoff.cwd, ...(presetId ? { agentPreset: presetId } : {}) },
+      setup: async (agentCtx) => {
+        if (presets && presetId) await presets.mount(agentCtx, presetId);
+        const dispose = installModelSelection(agentCtx, { current: selection, assembled: undefined });
+        if (typeof agentCtx?.effect === 'function') {
+          agentCtx.effect(() => dispose, 'issue-fixer:sync-conflict-model-selection');
+        }
+      },
+    };
+    let sessionId = `session-issuefix-${slug}-${randomUUID().slice(0, 8)}`;
+    let handle;
+    try {
+      handle = await agents.create({ sessionId, ...baseOptions });
+    } catch (error) {
+      if (!/exist|taken|duplicate|already/i.test(String(error))) throw error;
+      sessionId = `session-issuefix-${slug}-${randomUUID()}`;
+      handle = await agents.create({ sessionId, ...baseOptions });
+    }
+
+    const agent = handle.agent;
+    await agent.whenIdle();
+    let failure;
+    const stopErrors = ctx.on('agent/error', ({ agent: subject, error }) => {
+      if (subject === agent) failure = error;
+    });
+    try {
+      agent.followup(createUserMessage({
+        content: [{ type: 'text', text: syncConflictPrompt(handoff) }],
+        source: { kind: 'user' },
+      }));
+      const subagents = ctx.get?.('subagents');
+      for (;;) {
+        await agent.whenIdle();
+        const idleSeq = agent.session.seq;
+        // eslint-disable-next-line no-await-in-loop
+        if (!(await subagents?.waitForChildren(agent)) && agent.status === 'idle' && agent.session.seq === idleSeq) break;
+      }
+      await sessions.flush(agent.session);
+      if (failure !== undefined) throw failure instanceof Error ? failure : new Error(String(failure));
+    } finally {
+      stopErrors();
+    }
+    return { sessionId };
   }
 
   // Sequential only: parallel fix sessions in one checkout would fight over the
@@ -652,6 +903,7 @@ export function apply(ctx, rawConfig = {}) {
     let githubToken = base.githubToken;
     if (body.useGhCli === true) githubToken = '';
     else if (typeof body.githubToken === 'string' && body.githubToken.trim() !== '') githubToken = body.githubToken.trim();
+    const syncBody = body.sync && typeof body.sync === 'object' ? body.sync : null;
     return {
       settings: normalizeSettings({
         repo: typeof body.repo === 'string' ? body.repo : base.repo,
@@ -661,6 +913,20 @@ export function apply(ctx, rawConfig = {}) {
         githubToken,
         autoPr: typeof body.autoPr === 'boolean' ? body.autoPr : base.autoPr,
         autoUpdate: typeof body.autoUpdate === 'boolean' ? body.autoUpdate : base.autoUpdate,
+        sync: syncBody
+          ? {
+            enabled: syncBody.enabled === true,
+            upstreamRepo: typeof syncBody.upstreamRepo === 'string' ? syncBody.upstreamRepo : base.sync?.upstreamRepo ?? '',
+            upstreamRemote: typeof syncBody.upstreamRemote === 'string' ? syncBody.upstreamRemote : base.sync?.upstreamRemote ?? '',
+            mainBranch: typeof syncBody.mainBranch === 'string' ? syncBody.mainBranch : base.sync?.mainBranch ?? '',
+            modBranch: typeof syncBody.modBranch === 'string' ? syncBody.modBranch : base.sync?.modBranch ?? '',
+            mode: 'merge',
+            trigger: syncBody.trigger === 'auto' ? 'auto' : 'manual',
+            push: syncBody.push !== false,
+            minCommitsBehind: Number.isFinite(Number(syncBody.minCommitsBehind)) ? Number(syncBody.minCommitsBehind) : (base.sync?.minCommitsBehind ?? 0),
+            conflictResolution: syncBody.conflictResolution === 'agent' ? 'agent' : (base.sync?.conflictResolution === 'agent' ? 'agent' : 'manual'),
+          }
+          : base.sync,
       }),
       tokenFromUi: body.useGhCli === true ? false : (typeof body.githubToken === 'string' && body.githubToken.trim() !== '') || tokenFromUi,
     };
@@ -718,7 +984,15 @@ export function apply(ctx, rawConfig = {}) {
     return jsonResponse(200, { baseline: state.baseline, status: publicStatus() });
   }
 
-  async function resetRoute() {    stopWatching();
+  async function syncRoute(request) {
+    await readBody(request).catch(() => ({})); // body optional; consume to satisfy bridge
+    const result = await runForkSync('manual');
+    const status = result.ok ? 200 : (result.result === 'skipped' ? 409 : 422);
+    return jsonResponse(status, { result, status: publicStatus() });
+  }
+
+  async function resetRoute() {
+    stopWatching();
     settings = normalizeSettings(defaults);
     token = null;
     tokenFromUi = false;
@@ -728,6 +1002,7 @@ export function apply(ctx, rawConfig = {}) {
       state.identity = null;
       state.baseline = null;
       state.lastError = null;
+      state.sync = { lastRunAt: null, lastResult: null, lastMessage: null, lastSteps: [] };
       await persist();
     }
     return jsonResponse(200, { reset: true, status: publicStatus() });
@@ -740,6 +1015,7 @@ export function apply(ctx, rawConfig = {}) {
     { path: `${ROUTE_PREFIX}.check`, methods: ['POST'], requestBody: 'buffered', fetch: route(checkRoute) },
     { path: `${ROUTE_PREFIX}.save`, methods: ['POST'], requestBody: 'buffered', fetch: route(saveRoute) },
     { path: `${ROUTE_PREFIX}.baseline`, methods: ['POST'], requestBody: 'buffered', fetch: route(baselineRoute) },
+    { path: `${ROUTE_PREFIX}.sync`, methods: ['POST'], requestBody: 'buffered', fetch: route(syncRoute) },
     { path: `${ROUTE_PREFIX}.reset`, methods: ['POST'], requestBody: 'buffered', fetch: route(resetRoute) },
   ];
 

@@ -83,6 +83,7 @@ Open **Settings → Issue Fixer** and fill in:
    is how you get the plugin to revisit older issues.
 5. Choose **Use the GitHub CLI login on this machine** or paste a **token**.
 6. Optionally tick **After each fix: push the branch and open a pull request automatically**.
+7. **Fork sync (optional)** — for repos you fork: enable it, set the upstream repository (or let it auto-detect an `upstream` remote), your **main** branch, and your **modification branch** (the branch that keeps your own changes). Choose **Manual** (default, use **Sync now**) or **Auto** (after polls when idle, 10-minute cooldown). Optionally set **Minimum commits behind upstream** (`0` = sync whenever upstream has new commits; higher values skip upstream sync until your main branch is behind by at least that many commits, reducing frequent operations). For **merge conflicts in the modification branch**, choose **Manual** (default: abort the merge, restore the checkout, and report conflicted files) or **Agent resolves conflicts** (opt-in: keep the merge in progress, run an agent session in the same checkout to resolve conflicts and complete the merge while preserving upstream fixes and your local modifications, verify no unmerged paths remain, then push the modification branch if push is enabled; on failure it aborts/restores and does not push). Sync uses **merge** only (no rebase, no force-push): it fetches upstream, fast-forwards your main from upstream, merges main into your modification branch, and can push to origin if enabled. It refuses on a dirty working tree or if main has diverged from upstream (no force).
 
 Press **Check access** to see the full report without saving, then **Save and start watching**. Saving is
 only accepted when every blocking gate passes.
@@ -124,14 +125,15 @@ warning log — the local fix commits are never lost.
 
 The settings page also shows an **Issues** card: the issue being fixed right now (`fixing…`),
 queued issues, and every processed issue (newest first, up to 50 rows) with its title, status,
-fix branch and links to the GitHub issue and the opened pull request.
+fix branch and links to the GitHub issue and the opened pull request. It also shows **Fork sync**
+status (last run, result, and per-step log) when configured.
 
 ## State and files
 
 - `<DSH_HOME>\issue-fixer-state.json` — settings, verified identity, per-repository baseline, processed
-  map, last poll time/error. Written atomically with mode `0o600`. A GitHub token pasted in the UI is the
+  map, last poll time/error, and fork-sync status. Written atomically with mode `0o600`. A GitHub token pasted in the UI is the
   only credential that can end up in this file; a token from `gh auth token` never is.
-- The setup API lives on `/api/issue-fixer.{status,check,save,reset}` and rides the harness'
+- The setup API lives on `/api/issue-fixer.{status,check,save,baseline,sync,reset}` and rides the harness'
   authenticated `connection` Fetch registry: non-owner peers get `403`, unauthenticated browser requests
   get `401`.
 - The browser half is a plain classic-script bundle (`client.js`) registered as a `settings.section`; no

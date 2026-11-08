@@ -50,6 +50,7 @@ window.__ModuleLoader__.load({
 
     function draftFrom(status) {
       var settings = (status && status.settings) || {};
+      var sync = settings.sync || {};
       return {
         repo: settings.repo || "",
         cwd: settings.cwd || "",
@@ -62,6 +63,17 @@ window.__ModuleLoader__.load({
         baseline: status && status.activity && status.activity.baseline && status.activity.baseline.number
           ? String(status.activity.baseline.number)
           : "0",
+        syncEnabled: sync.enabled === true,
+        syncUpstreamRepo: sync.upstreamRepo || "",
+        syncUpstreamRemote: sync.upstreamRemote || "",
+        syncMainBranch: sync.mainBranch || "",
+        syncModBranch: sync.modBranch || "",
+        syncTrigger: sync.trigger === "auto" ? "auto" : "manual",
+        syncPush: sync.push !== false,
+        syncMinCommitsBehind: Number.isFinite(Number(sync.minCommitsBehind)) && Number(sync.minCommitsBehind) >= 0
+          ? String(Math.floor(Number(sync.minCommitsBehind)))
+          : "0",
+        syncConflictResolution: sync.conflictResolution === "agent" ? "agent" : "manual",
       };
     }
 
@@ -78,6 +90,18 @@ window.__ModuleLoader__.load({
         githubToken: draft.useGhCli === true ? "" : draft.token,
         autoPr: draft.autoPr === true,
         autoUpdate: draft.autoUpdate !== false,
+        sync: {
+          enabled: draft.syncEnabled === true,
+          upstreamRepo: draft.syncUpstreamRepo || "",
+          upstreamRemote: draft.syncUpstreamRemote || "",
+          mainBranch: draft.syncMainBranch || "",
+          modBranch: draft.syncModBranch || "",
+          mode: "merge",
+          trigger: draft.syncTrigger === "auto" ? "auto" : "manual",
+          push: draft.syncPush !== false,
+          minCommitsBehind: Math.max(0, Math.floor(Number(draft.syncMinCommitsBehind) || 0)),
+          conflictResolution: draft.syncConflictResolution === "agent" ? "agent" : "manual",
+        },
       };
     }
 
@@ -361,7 +385,30 @@ window.__ModuleLoader__.load({
             });
         }
 
-        function runReset() {          setBusy("reset");
+        function runSync() {
+          setBusy("sync");
+          setNote(null);
+          call("POST", "sync", {})
+            .then(function (result) {
+              setStatus(result.status || null);
+              var syncResult = result.result || {};
+              if (syncResult.ok) {
+                setNote({ kind: "good", text: syncResult.message || "Fork sync completed." });
+              } else {
+                setNote({ kind: syncResult.result === "skipped" ? "warn" : "bad", text: syncResult.message || "Fork sync did not complete." });
+              }
+            })
+            .catch(function (error) {
+              setReport(error.payload || null);
+              setNote({ kind: "bad", text: String(error.message || error) });
+            })
+            .then(function () {
+              setBusy("");
+            });
+        }
+
+        function runReset() {
+          setBusy("reset");
           setNote(null);
           call("POST", "reset", {})
             .then(function (result) {
@@ -432,6 +479,7 @@ window.__ModuleLoader__.load({
             row("Baseline", act.baseline && act.baseline.number ? act.baseline.repo + "#" + act.baseline.number : "none yet"),
             row("Fixed / failed", (act.counts ? act.counts.done : 0) + " / " + (act.counts ? act.counts.failed : 0)),
           ];
+          if (act.syncing) rows.push(row("Fork sync", "running…"));
           if (act.lastError) rows.push(row("Last error", h("span", { style: S.mono }, act.lastError)));
           if (status.update) {
             var up = status.update;
@@ -545,9 +593,55 @@ window.__ModuleLoader__.load({
             ),
             h(
               "div",
+              { style: S.card },
+              h("h3", { style: S.cardTitle }, "3. Fork sync (upstream → main → your modification branch)"),
+              h(
+                "label",
+                { style: { display: "flex", gap: 8, alignItems: "center" } },
+                h("input", { type: "checkbox", checked: draft.syncEnabled === true, disabled: disabled, onChange: function (event) { edit({ syncEnabled: event.target.checked }); } }),
+                h("span", {}, "Enable fork sync automation"),
+              ),
+              h("p", { style: S.hint }, "For forks: fetch upstream, fast-forward your main branch from upstream, then merge main into your modification branch. Refuses if the working tree is dirty, if main has diverged (no force), or on merge conflicts (aborts and restores)."),
+              draft.syncEnabled ? h(
+                "div",
+                { style: { display: "flex", flexDirection: "column", gap: 12 } },
+                field("Upstream repository (owner/name)", "The original repo you forked. Leave blank to auto-detect a non-fork remote.",
+                  h("input", { style: S.input, value: draft.syncUpstreamRepo, placeholder: "original-owner/repository", disabled: disabled, onChange: function (event) { edit({ syncUpstreamRepo: event.target.value }); } })),
+                field("Upstream remote name", "Optional. Defaults to auto-detect (or 'upstream' if added).",
+                  h("input", { style: S.input, value: draft.syncUpstreamRemote, placeholder: "upstream", disabled: disabled, onChange: function (event) { edit({ syncUpstreamRemote: event.target.value }); } })),
+                field("Main branch", "Branch kept in sync with upstream (usually main or master). Leave blank to auto-detect.",
+                  h("input", { style: S.input, value: draft.syncMainBranch, placeholder: "main", disabled: disabled, onChange: function (event) { edit({ syncMainBranch: event.target.value }); } })),
+                field("Modification branch (required)", "Your branch with custom changes. It will receive merges from main.",
+                  h("input", { style: S.input, value: draft.syncModBranch, placeholder: "my-mods", disabled: disabled, onChange: function (event) { edit({ syncModBranch: event.target.value }); } })),
+                field("Trigger",
+                  h("span", {}, "Choose when sync runs. ", h("strong", {}, "Manual"), " is the default."),
+                  h("select", { style: S.input, value: draft.syncTrigger, disabled: disabled, onChange: function (event) { edit({ syncTrigger: event.target.value }); } },
+                    h("option", { value: "manual" }, "Manual (Sync now button only)"),
+                    h("option", { value: "auto" }, "Auto (after polls, when idle; 10 min cooldown)")
+                  )),
+                field("Minimum commits behind upstream", "0 = always sync when upstream has new commits. Higher values skip upstream sync until your main branch is behind by at least that many commits (reduces frequent operations).",
+                  h("input", { style: S.input, type: "number", min: 0, step: 1, value: draft.syncMinCommitsBehind, disabled: disabled, onChange: function (event) { edit({ syncMinCommitsBehind: event.target.value }); } })),
+                field("On merge conflicts in the modification branch",
+                  "Manual (default) aborts the merge, restores the checkout, and reports conflicts. Agent (opt-in) keeps the merge in progress, asks an agent session to resolve conflicts and complete the merge, verifies no unmerged paths remain, then pushes the modification branch if push is enabled. It never force-pushes and aborts/restores on failure.",
+                  h("select", { style: S.input, value: draft.syncConflictResolution, disabled: disabled, onChange: function (event) { edit({ syncConflictResolution: event.target.value }); } },
+                    h("option", { value: "manual" }, "Manual (abort and report)"),
+                    h("option", { value: "agent" }, "Agent resolves conflicts, then verify/push (opt-in)")
+                  )),
+                h(
+                  "label",
+                  { style: { display: "flex", gap: 8, alignItems: "center" } },
+                  h("input", { type: "checkbox", checked: draft.syncPush !== false, disabled: disabled, onChange: function (event) { edit({ syncPush: event.target.checked }); } }),
+                  h("span", {}, "Push updated main and modification branches to origin after syncing"),
+                ),
+                h("p", { style: S.hint }, "Mode: merge only (no rebase, no force-push). Save settings first, then use Sync now.")
+              ) : null
+            ),
+            h(
+              "div",
               { style: S.actions },
               h("button", { style: S.button, disabled: disabled, onClick: runCheck }, busy === "check" ? "Checking…" : "Check access"),
               h("button", { style: S.primary, disabled: disabled, onClick: runSave }, busy === "save" ? "Saving…" : "Save and start watching"),
+              h("button", { style: S.button, disabled: disabled || !status || status.phase !== "ready" || !(status.settings && status.settings.sync && status.settings.sync.enabled), onClick: runSync }, busy === "sync" ? "Syncing…" : "Sync now"),
               h("button", { style: S.button, disabled: disabled, onClick: function () { refresh(true).catch(function (error) { setNote({ kind: "bad", text: String(error.message || error) }); }); } }, "Refresh"),
               h("button", { style: S.button, disabled: disabled, onClick: runReset }, "Clear settings"),
             ),
@@ -563,6 +657,19 @@ window.__ModuleLoader__.load({
           form,
           verdict,
           activity,
+          (status && status.sync && (status.sync.lastRunAt || status.sync.lastMessage))
+            ? h("div", { style: S.card },
+                h("h3", { style: S.cardTitle }, "Fork sync"),
+                row("Last run", formatTime(status.sync.lastRunAt)),
+                row("Result", status.sync.lastResult || "—"),
+                status.sync.lastMessage ? row("Message", h("span", { style: S.mono }, status.sync.lastMessage)) : null,
+                (status.sync.lastSteps && status.sync.lastSteps.length > 0)
+                  ? row("Steps", h("div", { style: S.mono }, status.sync.lastSteps.map(function (s) {
+                      return (s.ok ? "✓ " : "✕ ") + (s.label || "") + (s.detail ? ": " + s.detail : "");
+                    }).join("\n")))
+                  : null
+              )
+            : null,
           issuesCard,
           status && status.stateFile ? h("p", { style: S.hint }, "State file: " + status.stateFile) : null,
         );

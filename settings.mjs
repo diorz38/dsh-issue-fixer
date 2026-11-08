@@ -15,6 +15,9 @@ import { dirname } from 'node:path';
 export const MIN_INTERVAL_MS = 60_000;
 export const DEFAULT_INTERVAL_MS = 300_000;
 export const REPO_PATTERN = /^[\w.-]+\/[\w.-]+$/;
+export const SYNC_MODES = ['merge']; // rebase intentionally omitted (unsafe default); merge only for now
+export const SYNC_AUTO_MODES = ['manual', 'auto'];
+export const SYNC_CONFLICT_MODES = ['manual', 'agent']; // agent = opt-in: resolve mod-branch merge conflicts with an agent session, then verify/push
 
 /** Fields the user MUST fill before the plugin will watch anything. */
 export const REQUIRED_FIELDS = [
@@ -32,7 +35,7 @@ export const REQUIRED_FIELDS = [
 
 export function emptyState() {
   return {
-    version: 2,
+    version: 3,
     settings: null,
     identity: null,
     repo: null,
@@ -40,6 +43,33 @@ export function emptyState() {
     processed: {},
     lastPollAt: null,
     lastError: null,
+    sync: {
+      lastRunAt: null,
+      lastResult: null, // 'ok' | 'error' | 'conflict' | 'skipped'
+      lastMessage: null,
+      lastSteps: [],
+    },
+  };
+}
+
+function normalizeSync(raw = {}) {
+  const sync = raw && typeof raw === 'object' ? raw : {};
+  const trigger = SYNC_AUTO_MODES.includes(sync.trigger) ? sync.trigger : 'manual';
+  const conflictResolution = SYNC_CONFLICT_MODES.includes(sync.conflictResolution) ? sync.conflictResolution : 'manual';
+  const minCommitsBehindRaw = Number(sync.minCommitsBehind);
+  return {
+    enabled: sync.enabled === true,
+    upstreamRepo: typeof sync.upstreamRepo === 'string' ? sync.upstreamRepo.trim() : '',
+    upstreamRemote: typeof sync.upstreamRemote === 'string' ? sync.upstreamRemote.trim() : '',
+    mainBranch: typeof sync.mainBranch === 'string' ? sync.mainBranch.trim() : '',
+    modBranch: typeof sync.modBranch === 'string' ? sync.modBranch.trim() : '',
+    mode: 'merge', // merge only (user-selected strategy)
+    trigger, // 'manual' | 'auto'
+    push: sync.push !== false, // default true when enabled; explicit in UI
+    minCommitsBehind: Number.isFinite(minCommitsBehindRaw) && minCommitsBehindRaw >= 0
+      ? Math.floor(minCommitsBehindRaw)
+      : 0, // 0 = always sync when behind; >0 skips upstream sync if behind by fewer commits
+    conflictResolution, // 'manual' = abort+report on mod-branch conflicts; 'agent' = agent resolves in place, then verify/push
   };
 }
 
@@ -57,6 +87,7 @@ export function normalizeSettings(raw = {}) {
     githubToken: typeof raw.githubToken === 'string' ? raw.githubToken.trim() : '',
     autoPr: raw.autoPr === true,
     autoUpdate: raw.autoUpdate !== false,
+    sync: normalizeSync(raw.sync),
   };
   return settings;
 }
@@ -71,6 +102,23 @@ export function settingsProblems(settings) {
   }
   if (!settings.cwd) {
     problems.push({ field: 'cwd', label: 'Working directory', message: 'Required: the local checkout the fixes are committed in.' });
+  }
+  if (settings.sync?.enabled) {
+    if (!settings.sync.modBranch) {
+      problems.push({ field: 'sync.modBranch', label: 'Modification branch', message: 'Required when fork sync is enabled: the branch that holds your own modifications.' });
+    }
+    if (settings.sync.upstreamRepo && !REPO_PATTERN.test(settings.sync.upstreamRepo)) {
+      problems.push({ field: 'sync.upstreamRepo', label: 'Upstream repository', message: 'Use the owner/name form for the upstream repository.' });
+    }
+    if (settings.sync.mainBranch && settings.sync.modBranch && settings.sync.mainBranch === settings.sync.modBranch) {
+      problems.push({ field: 'sync.modBranch', label: 'Modification branch', message: 'The modification branch must be different from the main branch.' });
+    }
+    if (!Number.isInteger(settings.sync.minCommitsBehind) || settings.sync.minCommitsBehind < 0) {
+      problems.push({ field: 'sync.minCommitsBehind', label: 'Minimum commits behind', message: 'Minimum commits behind must be an integer 0 or greater.' });
+    }
+    if (settings.sync.conflictResolution && !SYNC_CONFLICT_MODES.includes(settings.sync.conflictResolution)) {
+      problems.push({ field: 'sync.conflictResolution', label: 'Conflict resolution', message: 'Conflict resolution must be manual or agent.' });
+    }
   }
   return problems;
 }
@@ -92,8 +140,10 @@ export function settingsFromState(state, defaults) {
 export async function loadState(file) {
   try {
     const parsed = JSON.parse(await readFile(file, 'utf8'));
-    const state = { ...emptyState(), ...parsed };
+    const base = emptyState();
+    const state = { ...base, ...parsed };
     state.processed = { ...(parsed.processed ?? {}) };
+    state.sync = { ...base.sync, ...(parsed.sync && typeof parsed.sync === 'object' ? parsed.sync : {}) };
     if (state.baseline === undefined || state.baseline === null) {
       // v1 recorded the newest issue number in `lastSeen`; keep it as a baseline
       // only when it is a real number, so a fresh install still baselines.
